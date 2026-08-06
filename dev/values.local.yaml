@@ -1,0 +1,50 @@
+# dev/values.local.yaml — local overrides for k3d
+
+install:
+  msspId: 'dec0de00-0000-4000-8000-000000000001'
+  msspName: 'DevLab'
+  msspSlug: 'devlab'
+  installId: 'dec0de00-0000-4000-8000-000000000002'
+  installLabel: 'dev-local'
+  bootstrapAdmin:
+    email: 'admin@devlab.local'
+    displayName: 'DevLab Admin'
+    password: 'dev-admin-pw-12345'
+
+image:
+  registry: cr.lab.atricore.io
+  tag: latest
+  pullPolicy: IfNotPresent
+
+tenantProvisioning:
+  adapterImageRepo: cr.lab.atricore.io/soctalk-adapter
+  adapterImageTag: latest
+  runsWorkerImageRepo: cr.lab.atricore.io/soctalk-orchestrator
+  runsWorkerImageTag: latest
+  tenantNetworkPoliciesEnabled: false
+
+ingress:
+  className: nginx
+  tls:
+    secretName: ''
+    issuerRef: ''
+  hostnames:
+    mssp: devlab.soctalk.local
+    customer: customer.soctalk.local
+  tenantWildcard: '*.soctalk.local'
+
+auth:
+  cookieSecure: false
+  publicOriginOverride: 'http://devlab.soctalk.local:8080,http://customer.soctalk.local:8080'
+
+admission:
+  engine: none
+
+networkPolicy:
+  cilium: false
+
+preInstallCheck:
+  enabled: false
+
+llm:
+  apiKey: ''

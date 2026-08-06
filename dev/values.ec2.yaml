@@ -1,0 +1,48 @@
+install:
+  msspId: 'dec0de00-0000-4000-8000-000000000001'
+  msspName: 'DevLab'
+  msspSlug: 'devlab'
+  installId: 'dec0de00-0000-4000-8000-000000000002'
+  installLabel: 'ec2-prod-poc'
+  bootstrapAdmin:
+    email: 'admin@devlab.local'
+    displayName: 'DevLab Admin'
+    password: 'dev-admin-pw-12345'
+
+image:
+  registry: docker.io/library
+  tag: latest
+  pullPolicy: IfNotPresent
+
+tenantProvisioning:
+  adapterImageRepo: soctalk-adapter
+  adapterImageTag: latest
+  runsWorkerImageRepo: soctalk-orchestrator
+  runsWorkerImageTag: latest
+  tenantNetworkPoliciesEnabled: false
+
+ingress:
+  className: nginx
+  tls:
+    secretName: ''
+    issuerRef: ''
+  hostnames:
+    mssp: ''
+    customer: ''
+  tenantWildcard: ''
+
+auth:
+  cookieSecure: false
+  publicOriginOverride: 'http://13.200.216.63:9080'
+
+admission:
+  engine: none
+
+networkPolicy:
+  cilium: false
+
+preInstallCheck:
+  enabled: false
+
+llm:
+  apiKey: ''
