@@ -32,8 +32,8 @@ ingress:
   tenantWildcard: ''
 
 auth:
-  cookieSecure: false
-  publicOriginOverride: 'http://13.200.216.63:9080'
+  cookieSecure: true
+  publicOriginOverride: 'https://13.200.216.63:9080'
 
 admission:
   engine: none
