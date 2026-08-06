@@ -1159,15 +1159,12 @@ async def audit_investigation(
             "events": events,
             "total_events": len(events),
         }
-
-
 # ---------------------------------------------------------------------------
-# /api/settings — minimal read-only snapshot
+# /api/settings — read, update, and reset settings
 # ---------------------------------------------------------------------------
-
 
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "id": "v1-readonly",
+    "id": "system_global_settings",
     "readonly": False,
     "sources": {},
     "llm_provider": "openai",
@@ -1175,35 +1172,35 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "llm_reasoning_model": "gpt-4o",
     "llm_temperature": 0.2,
     "llm_max_tokens": 4096,
-    "llm_anthropic_base_url": None,
-    "llm_openai_base_url": None,
-    "llm_openai_organization": None,
+    "llm_anthropic_base_url": "",
+    "llm_openai_base_url": "",
+    "llm_openai_organization": "",
     "anthropic_api_key_configured": False,
     "openai_api_key_configured": True,
     "llm_keys_conflict": False,
     "wazuh_enabled": True,
-    "wazuh_url": None,
+    "wazuh_url": "",
     "wazuh_verify_ssl": True,
     "wazuh_credentials_configured": True,
     "cortex_enabled": False,
-    "cortex_url": None,
+    "cortex_url": "",
     "cortex_verify_ssl": True,
     "cortex_api_key_configured": False,
     "thehive_enabled": False,
-    "thehive_url": None,
-    "thehive_organisation": None,
+    "thehive_url": "",
+    "thehive_organisation": "",
     "thehive_verify_ssl": True,
     "thehive_api_key_configured": False,
     "misp_enabled": False,
-    "misp_url": None,
+    "misp_url": "",
     "misp_verify_ssl": True,
     "misp_api_key_configured": False,
     "slack_enabled": False,
-    "slack_channel": None,
+    "slack_channel": "",
     "slack_notify_on_escalation": False,
     "slack_notify_on_verdict": False,
     "slack_webhook_configured": False,
-    "updated_at": datetime.now(timezone.utc).isoformat(),
+    "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
 }
 
 
@@ -1220,11 +1217,7 @@ def get_session(request: Request) -> AsyncSession:
 
 @router.get("/api/settings")
 async def settings_get(db: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    """Read-only settings snapshot backed by the DB.
-
-    Fetches the system global settings row and merges it over the default
-    settings shape so the UI gets the current persisted values.
-    """
+    """Read settings snapshot backed by the DB."""
     row = (
         await db.execute(
             select(UserSettings).where(UserSettings.id == "system_global_settings")
@@ -1250,14 +1243,18 @@ async def _upsert_settings(
 ) -> dict[str, Any]:
     valid_columns = {col.name for col in UserSettings.__table__.columns} - {"id", "updated_at"}
     update_values = {k: v for k, v in body.items() if k in valid_columns}
+    
+    # Naive UTC timestamp matching PostgreSQL TIMESTAMP WITHOUT TIME ZONE
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+
     stmt = pg_insert(UserSettings.__table__).values(
         id="system_global_settings",
         **update_values,
-        updated_at=datetime.now(timezone.utc),
+        updated_at=now_naive,
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=[UserSettings.__table__.c.id],
-        set_={**update_values, "updated_at": datetime.now(timezone.utc)},
+        set_={**update_values, "updated_at": now_naive},
     )
     await db.execute(stmt)
     await db.commit()
@@ -1269,8 +1266,23 @@ async def _upsert_settings(
 async def settings_post(
     body: dict[str, Any] = Body(...), db: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
-    """Accept settings updates from the legacy UI and persist them permanently."""
+    """Accept settings updates and persist them permanently."""
     return await _upsert_settings(db, body)
 
+
+@router.delete("/api/settings")
+@router.post("/api/settings/reset")
+async def settings_reset(db: AsyncSession = Depends(get_session)) -> dict[str, Any]:
+    """Reset settings to default by purging custom DB override row."""
+    from sqlalchemy import delete
+    await db.execute(
+        delete(UserSettings).where(UserSettings.id == "system_global_settings")
+    )
+    await db.commit()
+    
+    # Return flat settings payload matching GET /api/settings response format
+    res = DEFAULT_SETTINGS.copy()
+    res["updated_at"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    return res
 
 __all__ = ["router"]
