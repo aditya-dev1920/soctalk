@@ -1159,6 +1159,7 @@ async def audit_investigation(
             "events": events,
             "total_events": len(events),
         }
+        
 # ---------------------------------------------------------------------------
 # /api/settings — read, update, and reset settings
 # ---------------------------------------------------------------------------
@@ -1179,7 +1180,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "openai_api_key_configured": True,
     "llm_keys_conflict": False,
     "wazuh_enabled": True,
-    "wazuh_url": "",
+    "wazuh_url": "https://172.31.12.57:55000",
     "wazuh_verify_ssl": True,
     "wazuh_credentials_configured": True,
     "cortex_enabled": False,
