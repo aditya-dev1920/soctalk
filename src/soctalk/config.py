@@ -386,7 +386,7 @@ def load_config(env_file: Optional[Path] = None) -> Config:
         thehive_mcp_server=thehive_config,
         misp_mcp_server=misp_config,
         llm=llm_config,
-        log_level=os.getenv("SOCTALK_LOG_LEVEL", "INFO"),
+        log_level=os.getenv("SOCTALK_LOG_LEVEL", "DEBUG"),
         log_format=os.getenv("SOCTALK_LOG_FORMAT", "json"),
     )
 
