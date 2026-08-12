@@ -407,7 +407,7 @@ def _hit_to_event(hit: dict) -> dict | None:
 
 
 def _min_severity() -> int:
-    raw = os.environ.get("SOCTALK_ADAPTER_MIN_SEVERITY", "10")
+    raw = os.environ.get("SOCTALK_ADAPTER_MIN_SEVERITY", "5")
     try:
         v = int(raw)
     except ValueError:
@@ -554,7 +554,7 @@ async def _ingest_loop() -> None:
     if os.environ.get("SOCTALK_INGEST_DISABLED", "0") in {"1", "true"}:
         logger.info("ingest_disabled")
         return
-    interval = float(os.environ.get("SOCTALK_INGEST_INTERVAL_SECONDS", "15"))
+    interval = float(os.environ.get("SOCTALK_INGEST_INTERVAL_SECONDS", "60"))
     batch_size = int(os.environ.get("SOCTALK_INGEST_BATCH_SIZE", "100"))
     api_url = os.environ["SOCTALK_API_URL"].rstrip("/")
     tenant_id = os.environ["SOCTALK_TENANT_ID"]
