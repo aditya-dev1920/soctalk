@@ -210,7 +210,7 @@ def _is_routable_ip(ip: str) -> bool:
         return False
     return True
 
-
+## IOC Extraction for Network Artifacts (IPv4, SHA256, MD5, Domain) from Wazuh alert details in initial triage stage for agent, asset and identity context details
 def _extract_iocs(text: str) -> list[dict]:
     if not text:
         return []
@@ -252,7 +252,7 @@ _FIM_FILE_RE = re.compile(r"File '([^']+)' (?:was )?(?:modified|added|deleted|ch
 _USERID_KV_RE = re.compile(r"\b(?:USER|user|uid)=([A-Za-z0-9_\-.]+)")
 _IP_RE = re.compile(r"\b(?:from|src ip|source)\s*[=:]?\s*((?:\d{1,3}\.){3}\d{1,3})", re.I)
 
-
+## Artifact for file & FIM artifacts in intial triage stage for agent
 def _extract_subject(full_log: str) -> str | None:
     """Best-effort extraction of the alert's primary subject from
     Wazuh's ``full_log`` line. Handles common useradd / groupadd / FIM
@@ -280,10 +280,11 @@ def _compose_title(rule_desc: str, agent_name: str | None, subject: str | None) 
     if subject:
         base = f"{base}: {subject}"
     if agent_name:
-        base = f"{base} on {agent_name}"
+        base = f"{base} on {agent_name}" ## agent name captured in agent, asset and identity context for title composition in initial triage
     return base[:255]
 
 
+# To check involved accounts (Actor/Target) 
 def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[dict]:
     """Typed, role-carrying entities from fields the Wazuh decoder already
     parsed (issue #17 fix 1). ``source_field`` preserves provenance.
@@ -305,6 +306,8 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
         add("host", agent.get("name") or agent.get("id"), "target", "agent.name")
     data = src.get("data") or {}
     if isinstance(data, dict):
+        
+        ### Data being fetched by initial triage phase for capturing agent, asset and identity context
         add("user", data.get("srcuser"), "actor", "data.srcuser")
         add("user", data.get("dstuser"), "target", "data.dstuser")
         add("user", data.get("user"), "actor", "data.user")
@@ -332,6 +335,8 @@ def _extract_mitre(rule: dict) -> dict:
     def _cap(v):
         return [str(x)[:32] for x in (v or [])][:16]
     out = {
+        
+        #### Mitre data captured in initial triage stage for alert details
         "ids": _cap(mitre.get("id")),
         "tactics": _cap(mitre.get("tactic")),
         "techniques": _cap(mitre.get("technique")),
@@ -341,13 +346,13 @@ def _extract_mitre(rule: dict) -> dict:
 
 def _hit_to_event(hit: dict) -> dict | None:
     src = hit.get("_source") or {}
-    source_id = src.get("id") or hit.get("_id")
+    source_id = src.get("id") or hit.get("_id")  ## Wazuh Alert ID captured in Alert details
     if not source_id:
         return None
     rule = src.get("rule") or {}
     agent = src.get("agent") or {}
     full_log = src.get("full_log") or ""
-    rule_desc = rule.get("description") or ""
+    rule_desc = rule.get("description") or "" #### Description from Wazuh alert captured in initial triage stage for alert details
     agent_name = agent.get("name") if isinstance(agent, dict) else None
     asset_ids: list[str] = []
     if isinstance(agent, dict) and agent.get("id"):
@@ -356,7 +361,7 @@ def _hit_to_event(hit: dict) -> dict | None:
         asset_ids.append(agent_name[:64])
 
     # IOC extraction reads the RAW text (must run before redaction).
-    iocs = _extract_iocs(f"{rule_desc} {full_log}")
+    iocs = _extract_iocs(f"{rule_desc} {full_log}") ## automatically parses routable IPv4 addresses, domains, SHA256, and MD5 hashes from raw log text.
     entities = _extract_entities(src, agent, agent_name)
 
     # Redaction (issue #17 fix 9): strip secrets from every outbound text
@@ -364,7 +369,7 @@ def _hit_to_event(hit: dict) -> dict | None:
     # on the FULL text, THEN truncate — truncating first could cut a
     # multi-line secret (e.g. a PEM block) before its END marker so the
     # pattern never matches.
-    full_log_red = redact_text(full_log)[:4096] if full_log else ""
+    full_log_red = redact_text(full_log)[:4096] if full_log else ""   ## Full log data from wazuh for alert details redacted 40% to remove if some secrets are present in the log
     rule_desc_red = redact_text(rule_desc)[:512] if rule_desc else ""
     description = redact_text((full_log or rule_desc).strip())[:1024] or None
     title = redact_text(
@@ -376,7 +381,7 @@ def _hit_to_event(hit: dict) -> dict | None:
 
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     return {
-        "source_event_id": str(source_id)[:128],
+        "source_event_id": str(source_id)[:128], ## Wazuh Alert ID captured in Alert details
         "source": "wazuh",
         "rule_id": (str(rule.get("id"))[:64] if rule.get("id") else None),
         "severity": _severity_from_rule_level(rule.get("level")),
@@ -390,8 +395,8 @@ def _hit_to_event(hit: dict) -> dict | None:
         "entities": entities,
         "mitre": _extract_mitre(rule),
         "rule_groups": [str(g)[:64] for g in (rule.get("groups") or [])][:16],
-        "decoder": (src.get("decoder") or {}).get("name"),
-        "full_log": full_log_red,
+        "decoder": (src.get("decoder") or {}).get("name"),  ## Decoder name for wazuh alert details
+        "full_log": full_log_red, #### Full log data from wazuh for alert details
         "template_hash": thash,
         "template_version": TEMPLATE_VERSION,
         "redaction_version": REDACTION_VERSION,
@@ -399,7 +404,7 @@ def _hit_to_event(hit: dict) -> dict | None:
             "rule_description": rule_desc_red,
             "rule_groups": rule.get("groups") or [],
             "decoder_name": (src.get("decoder") or {}).get("name"),
-            "location": src.get("location"),
+            "location": src.get("location"), ## Wazuh alert location captured in alert details for DECODER 
             "manager_name": (src.get("manager") or {}).get("name"),
             "full_log": full_log_red,
         },
@@ -426,7 +431,7 @@ async def _query_alerts(
     # are still absorbed by the control-plane idempotency constraint.
     filters: list[dict] = [
         {"range": {"@timestamp": {"gte": since_ts}}},
-        {"range": {"rule.level": {"gte": _min_severity()}}},
+        {"range": {"rule.level": {"gte": _min_severity()}}}, ## Range level data captured in alert details for severity filtering
     ]
     must_not: list[dict] = []
     # By default the Wazuh manager pod's agent (id 000) flood-generates
@@ -434,7 +439,7 @@ async def _query_alerts(
     # security signals. Default behaviour is to skip them; flip the
     # env var to "0" to ingest manager-self alerts too.
     if os.environ.get("SOCTALK_ADAPTER_EXCLUDE_MANAGER_AGENT", "1") in {"1", "true"}:
-        must_not.append({"term": {"agent.id": "000"}})
+        must_not.append({"term": {"agent.id": "000"}}) #
     # Optional allowlist by agent.name prefix — when set, only agents
     # whose name starts with the prefix are ingested. Useful to scope
     # ingestion to docker-based endpoints like ``linux-ep-*``.

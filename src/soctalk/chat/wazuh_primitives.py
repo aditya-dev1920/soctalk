@@ -817,6 +817,7 @@ async def get_wazuh_agents(
         return _wrap_error(e, op="agents")
 
 
+# Agent Health & Keep alive to get status API and heartbeat
 async def get_wazuh_agent_processes(
     db: AsyncSession,
     *,

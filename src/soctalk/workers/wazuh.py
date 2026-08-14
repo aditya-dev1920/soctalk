@@ -115,6 +115,7 @@ async def _get_agent_context(client: Any, state: dict[str, Any]) -> dict[str, An
     return state
 
 
+# Function to get agent forensics for agent heath and keep alive to get status API and heartbeat in intial triage stage for agent, asset and identity context details
 async def _get_agent_forensics(client: Any, state: dict[str, Any]) -> dict[str, Any]:
     """Get forensic data (processes, ports) for agents.
 

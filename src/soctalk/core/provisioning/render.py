@@ -496,7 +496,7 @@ def render_tenant_values(
                     integration.wazuh_verify_ssl if is_provided else False
                 ),
                 "minSeverity": int(
-                    os.getenv("SOCTALK_ADAPTER_MIN_SEVERITY", "10")
+                    os.getenv("SOCTALK_ADAPTER_MIN_SEVERITY", "5")
                 ),
             },
         },

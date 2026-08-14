@@ -59,19 +59,19 @@ class AdapterEvent(BaseModel):
     # --- schema v1 fields (frozen shapes) ---------------------------------
     source_event_id: str = Field(..., max_length=128)
     source: str = Field(default="wazuh", max_length=32)
-    rule_id: str | None = Field(default=None, max_length=64)
-    severity: int = Field(ge=0, le=15)
+    rule_id: str | None = Field(default=None, max_length=64) ## Captured in initial triage phase for alert details
+    severity: int = Field(ge=0, le=15) ## captured in initial triage stage for alert details
     asset_ids: list[str] = Field(default_factory=list)
     initial_iocs: list[IngestedIOC] = Field(default_factory=list)
-    ts: datetime | None = None  # event OCCURRENCE time
-    description: str | None = Field(default=None, max_length=1024)
+    ts: datetime | None = None  # event OCCURRENCE time from wazuh for alert details in initial triage stage
+    description: str | None = Field(default=None, max_length=1024) ## initial triage alert details captured from Wazuh
     title: str | None = Field(default=None, max_length=255)
-    raw: dict[str, Any] | None = None
+    raw: dict[str, Any] | None = None ## initial triage alert details captured from Wazuh for raw description in alert details
 
     # --- schema v2 additions (all optional) -------------------------------
-    entities: list[WireEntity] = Field(default_factory=list, max_length=64)
+    entities: list[WireEntity] = Field(default_factory=list, max_length=64) ## Involved accounts (Actor/Target) captured in initial triage stage for agent, asset and identity context details
     mitre: WireMitre | None = None
-    rule_groups: list[str] = Field(default_factory=list, max_length=16)
+    rule_groups: list[str] = Field(default_factory=list, max_length=16) ## initial triage rule groups captured from Wazuh
     decoder: str | None = Field(default=None, max_length=128)
     full_log: str | None = Field(default=None, max_length=4096)  # REDACTED
     template_hash: str | None = Field(default=None, max_length=64)

@@ -69,7 +69,7 @@ def _luhn_ok(number: str) -> bool:
         checksum += d
     return checksum % 10 == 0
 
-
+#### Secret redaction is applied to the following fields in the AdapterEvent model: - description - title - raw.* (all raw fields) - full_log
 def redact_text(text: str | None) -> str | None:
     """Replace detected secrets with typed markers. Idempotent-ish: a
     marker contains no secret-shaped substring, so re-running is a no-op."""
