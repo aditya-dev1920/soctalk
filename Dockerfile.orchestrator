@@ -1,16 +1,14 @@
-# =============================================================================
-# SocTalk Orchestrator - Download pre-built MCP server binaries
-# =============================================================================
-
+### =============================================================================
+### SocTalk Orchestrator - Universal Plug-and-Play MCP Build
+### =============================================================================
 FROM python:3.13-slim
 
-LABEL maintainer="soctalk"
+LABEL maintainer="soctalk" 
 LABEL description="SocTalk Orchestrator - Alert polling and investigation processing"
 
 WORKDIR /app
 
-# Install system dependencies. ``procps`` is required by the chart's
-# orchestrator readinessProbe (``pgrep -f soctalk.orchestrator``).
+### Install system dependencies. 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     jq \
@@ -20,82 +18,62 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Create MCP servers directory
+### Create MCP servers directory
 RUN mkdir -p /opt/mcp-servers
 
-# GitHub org/user for MCP servers
+### GitHub org/user for MCP servers
 ARG MCP_GITHUB_ORG=gbrigandi
 
-# Download mcp-server-wazuh (linux-amd64)
-ARG WAZUH_MCP_VERSION=latest
+### ==========================================
+### Download: mcp-server-wazuh 
+### ==========================================
+ARG WAZUH_MCP_VERSION=latest 
 RUN REPO="${MCP_GITHUB_ORG}/mcp-server-wazuh" && \
     if [ "$WAZUH_MCP_VERSION" = "latest" ]; then \
       API_URL="https://api.github.com/repos/${REPO}/releases/latest"; \
     else \
       API_URL="https://api.github.com/repos/${REPO}/releases/tags/${WAZUH_MCP_VERSION}"; \
     fi && \
-    URL=$(curl -sk "$API_URL" | jq -r '.assets[] | select(.name | test("linux.*amd64$")) | .browser_download_url' | head -1) && \
+    URL=$(curl -sk -H "User-Agent: Mozilla/5.0" "$API_URL" | jq -r '.assets[]? | select(.name | test("linux.*amd64$")) | .browser_download_url' | head -1) && \
+    if [ -z "$URL" ] || [ "$URL" = "null" ]; then \
+      URL="https://github.com/${REPO}/releases/latest/download/mcp-server-wazuh-linux-amd64"; \
+    fi && \
     echo "Downloading mcp-server-wazuh from: $URL" && \
     curl -skL "$URL" -o /opt/mcp-servers/mcp-server-wazuh && \
     chmod +x /opt/mcp-servers/mcp-server-wazuh
 
-# Download mcp-server-cortex (linux-amd64)
-ARG CORTEX_MCP_VERSION=latest
-RUN REPO="${MCP_GITHUB_ORG}/mcp-server-cortex" && \
-    if [ "$CORTEX_MCP_VERSION" = "latest" ]; then \
-      API_URL="https://api.github.com/repos/${REPO}/releases/latest"; \
-    else \
-      API_URL="https://api.github.com/repos/${REPO}/releases/tags/${CORTEX_MCP_VERSION}"; \
-    fi && \
-    URL=$(curl -sk "$API_URL" | jq -r '.assets[] | select(.name | test("linux.*amd64$")) | .browser_download_url' | head -1) && \
-    echo "Downloading mcp-server-cortex from: $URL" && \
-    curl -skL "$URL" -o /opt/mcp-servers/mcp-server-cortex && \
-    chmod +x /opt/mcp-servers/mcp-server-cortex
-
-# Download mcp-server-thehive (linux-amd64)
-ARG THEHIVE_MCP_VERSION=latest
-RUN REPO="${MCP_GITHUB_ORG}/mcp-server-thehive" && \
-    if [ "$THEHIVE_MCP_VERSION" = "latest" ]; then \
-      API_URL="https://api.github.com/repos/${REPO}/releases/latest"; \
-    else \
-      API_URL="https://api.github.com/repos/${REPO}/releases/tags/${THEHIVE_MCP_VERSION}"; \
-    fi && \
-    URL=$(curl -sk "$API_URL" | jq -r '.assets[] | select(.name | test("linux.*amd64$")) | .browser_download_url' | head -1) && \
-    echo "Downloading mcp-server-thehive from: $URL" && \
-    curl -skL "$URL" -o /opt/mcp-servers/mcp-server-thehive && \
-    chmod +x /opt/mcp-servers/mcp-server-thehive
-
-# Download mcp-server-misp (linux-amd64)
-ARG MISP_MCP_VERSION=latest
+### ==========================================
+### Download: mcp-server-misp 
+### ==========================================
+ARG MISP_MCP_VERSION=latest 
 RUN REPO="${MCP_GITHUB_ORG}/mcp-server-misp" && \
     if [ "$MISP_MCP_VERSION" = "latest" ]; then \
       API_URL="https://api.github.com/repos/${REPO}/releases/latest"; \
     else \
       API_URL="https://api.github.com/repos/${REPO}/releases/tags/${MISP_MCP_VERSION}"; \
     fi && \
-    URL=$(curl -sk "$API_URL" | jq -r '.assets[] | select(.name | test("linux.*amd64$")) | .browser_download_url' | head -1) && \
+    URL=$(curl -sk -H "User-Agent: Mozilla/5.0" "$API_URL" | jq -r '.assets[]? | select(.name | test("linux.*amd64$")) | .browser_download_url' | head -1) && \
+    if [ -z "$URL" ] || [ "$URL" = "null" ]; then \
+      URL="https://github.com/${REPO}/releases/latest/download/mcp-server-misp-linux-amd64"; \
+    fi && \
     echo "Downloading mcp-server-misp from: $URL" && \
     curl -skL "$URL" -o /opt/mcp-servers/mcp-server-misp && \
     chmod +x /opt/mcp-servers/mcp-server-misp
 
-# Copy Python project files
-COPY pyproject.toml README.md ./
+### ==========================================
+### Copy Python Project Files & Dependencies
+### ==========================================
+COPY pyproject.toml README.md ./ 
 COPY src/soctalk ./src/soctalk
-# soctalk_wire + soctalk_entities are declared packages in pyproject and imported
-# at runtime (soctalk.core.ir.graph → soctalk_entities); copy them before
-# ``pip install .`` or the image crashes on boot with ModuleNotFoundError.
-COPY src/soctalk_wire ./src/soctalk_wire
+COPY src/soctalk_wire ./src/soctalk_wire 
 COPY src/soctalk_entities ./src/soctalk_entities
 
-# Install Python dependencies
 RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host files.pythonhosted.org .
 
-# Set MCP server paths
-ENV WAZUH_MCP_SERVER_PATH=/opt/mcp-servers/mcp-server-wazuh
-ENV CORTEX_MCP_SERVER_PATH=/opt/mcp-servers/mcp-server-cortex
-ENV THEHIVE_MCP_SERVER_PATH=/opt/mcp-servers/mcp-server-thehive
+### Set MCP server paths
+ENV WAZUH_MCP_SERVER_PATH=/opt/mcp-servers/mcp-server-wazuh 
+ENV CORTEX_MCP_SERVER_PATH=/opt/mcp-servers/mcp-server-cortex 
+ENV THEHIVE_MCP_SERVER_PATH=/opt/mcp-servers/mcp-server-thehive 
 ENV MISP_MCP_SERVER_PATH=/opt/mcp-servers/mcp-server-misp
 
-# Run the per-tenant runs worker (L2). The tenant chart sets the same
-# entrypoint explicitly; this default keeps the image runnable standalone.
 CMD ["python", "-m", "soctalk.runs_worker.main"]

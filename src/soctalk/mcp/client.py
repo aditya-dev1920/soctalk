@@ -161,7 +161,8 @@ class MCPClient:
             self._tools[tool.name] = {
                 "name": tool.name,
                 "description": tool.description,
-                "inputSchema": tool.inputSchema,
+                # Patched implementation:
+                "inputSchema": getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None),
             }
             logger.debug("mcp_tool_discovered", server=self.name, tool=tool.name)
 
