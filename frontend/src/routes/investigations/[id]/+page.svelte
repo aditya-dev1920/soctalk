@@ -114,22 +114,29 @@
 
 		switch (eventType) {
 			case 'alert_ingested':
-        	case 'alert.ingested':
-        	case 'alert.added':
-        	case 'alert.correlated':
+			case 'alert.ingested':
+			case 'alert.added':
+			case 'alert.correlated':
 				if (data.rule_id) details.push({ label: 'Rule ID', value: String(data.rule_id) });
 				if (data.severity) details.push({ label: 'Severity', value: String(data.severity).toUpperCase(), highlight: Number(data.severity) >= 8 });
 				if (data.event_count && Number(data.event_count) > 1) details.push({ label: 'Coalesced Count', value: `${data.event_count}x` });
 				if (data.asset_ids && Array.isArray(data.asset_ids) && data.asset_ids.length > 0) {
 					details.push({ label: 'Assets', value: (data.asset_ids as string[]).join(', ') });
-            }
-            if (data.mitre && typeof data.mitre === 'object') {
-                const mitreObj = data.mitre as Record<string, unknown>;
-                const mitreIds = (mitreObj.ids as string[]) || (mitreObj.id ? [String(mitreObj.id)] : []);
-                if (mitreIds.length > 0) details.push({ label: 'MITRE', value: mitreIds.join(', ') });
-            }
-            if (data.source_event_id) details.push({ label: 'Event ID', value: String(data.source_event_id) });
-            break;
+				}
+				if (data.mitre && typeof data.mitre === 'object') {
+					const mitreObj = data.mitre as Record<string, unknown>;
+					const mitreIds = (mitreObj.ids as string[]) || (mitreObj.id ? [String(mitreObj.id)] : []);
+					if (mitreIds.length > 0) details.push({ label: 'MITRE', value: mitreIds.join(', ') });
+				}
+				if (data.rule_groups && Array.isArray(data.rule_groups) && data.rule_groups.length > 0) {
+					details.push({ label: 'Groups', value: (data.rule_groups as string[]).join(', ') });
+				}
+				if (data.initial_iocs && Array.isArray(data.initial_iocs) && data.initial_iocs.length > 0) {
+					const iocVals = data.initial_iocs.map((i: any) => i.value || i).filter(Boolean);
+					if (iocVals.length > 0) details.push({ label: 'IOCs', value: iocVals.join(', '), highlight: true });
+				}
+				if (data.source_event_id) details.push({ label: 'Event ID', value: String(data.source_event_id) });
+				break;
 
 			case 'investigation.created':
 				if (data.alert_ids) details.push({ label: 'Alerts', value: `${(data.alert_ids as string[]).length} alerts` });
@@ -638,10 +645,19 @@
 											{/if}
 
 											<details open={!event.data?.full_log && !event.data?.raw_log && !event.data?.raw}>
-												<summary class="text-xs text-surface-400 cursor-pointer hover:text-surface-200 font-medium">
-													Structured Event Metadata JSON
+												<summary class="text-xs text-surface-400 cursor-pointer hover:text-surface-200 font-medium flex items-center justify-between">
+													<span>Structured Event Metadata JSON</span>
 												</summary>
-												<pre class="mt-2 text-xs overflow-x-auto whitespace-pre-wrap font-mono text-surface-300 bg-black/40 p-3 rounded border border-surface-700/60">{JSON.stringify(event.data, null, 2)}</pre>
+												<div class="mt-2 flex justify-end">
+													<button
+														type="button"
+														on:click={() => copyToClipboard(JSON.stringify(event.data, null, 2), `${event.id}-json`)}
+														class="btn btn-sm variant-soft text-xs py-0.5 px-2 mb-1"
+													>
+														{copiedLogId === `${event.id}-json` ? '✅ Copied JSON!' : '📋 Copy JSON'}
+													</button>
+												</div>
+												<pre class="text-xs overflow-x-auto whitespace-pre-wrap font-mono text-surface-300 bg-black/40 p-3 rounded border border-surface-700/60">{JSON.stringify(event.data, null, 2)}</pre>
 											</details>
 										</div>
 									{/if}
