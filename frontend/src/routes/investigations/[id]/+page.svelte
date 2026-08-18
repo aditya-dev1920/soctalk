@@ -18,6 +18,7 @@
 	let showCancelModal = false;
 	let cancelReason = '';
 	let expandedEvents: Set<string> = new Set();
+	let copiedLogId: string | null = null;
 
 	function toggleEventDetails(eventId: string) {
 		if (expandedEvents.has(eventId)) {
@@ -26,6 +27,15 @@
 			expandedEvents.add(eventId);
 		}
 		expandedEvents = new Set(expandedEvents);
+	}
+
+	function copyToClipboard(text: string, id: string) {
+		navigator.clipboard.writeText(text);
+		copiedLogId = id;
+		addToast({ type: 'success', message: 'Raw log copied to clipboard for Jira!' });
+		setTimeout(() => {
+			if (copiedLogId === id) copiedLogId = null;
+		}, 2500);
 	}
 
 	function formatEventSummary(eventType: string, data: Record<string, unknown>): string {
@@ -269,7 +279,6 @@
 </svelte:head>
 
 {#if !loading && investigation}
-	<!-- Floating "Ask AI" trigger; opens the chat dock as an overlay. -->
 	<button
 		type="button"
 		class="chat-launcher btn variant-filled-primary"
@@ -297,7 +306,6 @@
 		<span>Error: {error}</span>
 	</div>
 {:else if investigation}
-	<!-- Header -->
 	<div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-4 mb-6">
 		<div>
 			<div class="flex items-center gap-2 mb-2">
@@ -324,11 +332,6 @@
 			</div>
 		</div>
 
-		<!-- Action Buttons -->
-		<!-- Cancel is the only lifecycle action wired to the backend. Pause/resume
-		     were removed (issue #16): the runs worker has no pause semantics, so
-		     those buttons would 404 or lie about backend state. Cancel is shown
-		     for any non-terminal investigation. -->
 		<div class="flex gap-2">
 			{#if !['closed', 'auto_closed_fp', 'closed_fp', 'closed_tp', 'cancelled'].includes(investigation.status)}
 				<button
@@ -345,7 +348,6 @@
 		</div>
 	</div>
 
-	<!-- Info Cards -->
 	<div class="grid grid-cols-2 lg:grid-cols-6 gap-4 mb-6">
 		<div class="card p-3">
 			<h4 class="text-xs opacity-60">Alerts</h4>
@@ -373,11 +375,8 @@
 		</div>
 	</div>
 
-	<!-- Main Content Grid -->
 	<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-		<!-- Left Column: Details + Verdict -->
 		<div class="space-y-6">
-			<!-- Investigation Details -->
 			<div class="card p-4">
 				<h3 class="h4 mb-4">Details</h3>
 				<dl class="space-y-2">
@@ -414,7 +413,6 @@
 				</dl>
 			</div>
 
-			<!-- Verdict -->
 			{#if investigation.verdict_decision}
 				<div class="card p-4">
 					<h3 class="h4 mb-4">Verdict</h3>
@@ -453,7 +451,6 @@
 				</div>
 			{/if}
 
-			<!-- Agent Run (LangGraph) -->
 			{#if investigation.tokens_used !== null && investigation.tokens_used !== undefined}
 				{#if !$isCustomerScope}
 					<div class="card p-4">
@@ -493,7 +490,6 @@
 				{/if}
 			{/if}
 
-			<!-- Observable Stats -->
 			<div class="card p-4">
 				<h3 class="h4 mb-4">Observable Summary</h3>
 				<div class="space-y-2">
@@ -526,18 +522,17 @@
 			</div>
 		</div>
 
-		<!-- Right Column: Event Timeline -->
 		<div class="lg:col-span-2">
 			<div class="card p-4">
-					<div class="flex items-center justify-between mb-4">
-						<h3 class="h4">Event Timeline</h3>
-						<button class="btn btn-sm variant-soft" on:click={loadEvents} disabled={eventsLoading}>
-							{#if eventsLoading}
-								<span class="inline-block animate-spin rounded-full h-4 w-4 border-b-2 border-current mr-2"></span>
-							{/if}
-							Refresh
-						</button>
-					</div>
+				<div class="flex items-center justify-between mb-4">
+					<h3 class="h4">Event Timeline</h3>
+					<button class="btn btn-sm variant-soft" on:click={loadEvents} disabled={eventsLoading}>
+						{#if eventsLoading}
+							<span class="inline-block animate-spin rounded-full h-4 w-4 border-b-2 border-current mr-2"></span>
+						{/if}
+						Refresh
+					</button>
+				</div>
 
 				{#if eventsLoading && events.length === 0}
 					<div class="flex items-center justify-center py-8">
@@ -546,11 +541,10 @@
 				{:else if events.length === 0}
 					<p class="opacity-60 text-center py-8">No events recorded</p>
 				{:else}
-					<div class="space-y-4 max-h-[600px] overflow-y-auto pr-2">
+					<div class="space-y-4 max-h-[650px] overflow-y-auto pr-2">
 						{#each events as event, i}
 							{@const details = getEventDetails(event.event_type, event.data)}
 							<div class="flex gap-3">
-								<!-- Timeline Line -->
 								<div class="flex flex-col items-center">
 									<div class="w-8 h-8 rounded-full bg-surface-500/30 flex items-center justify-center {getEventColor(event.event_type)}">
 										<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -562,7 +556,6 @@
 									{/if}
 								</div>
 
-								<!-- Event Content -->
 								<div class="flex-1 pb-4">
 									<div class="flex items-center gap-2 mb-1">
 										<span class="badge variant-soft text-xs">{formatEventType(event.event_type)}</span>
@@ -570,10 +563,8 @@
 											{new Date(event.timestamp).toLocaleString()}
 										</span>
 									</div>
-									<!-- Human-readable summary -->
 									<p class="text-sm font-medium mb-2">{formatEventSummary(event.event_type, event.data)}</p>
 
-									<!-- Structured details if available -->
 									{#if details.length > 0}
 										<div class="flex flex-wrap gap-x-4 gap-y-1 text-xs mb-2">
 											{#each details as detail}
@@ -585,7 +576,6 @@
 										</div>
 									{/if}
 
-									<!-- Expandable JSON details -->
 									<button
 										class="text-xs opacity-60 hover:opacity-100 flex items-center gap-1 transition-opacity"
 										on:click={() => toggleEventDetails(event.id)}
@@ -601,9 +591,33 @@
 										</svg>
 										{expandedEvents.has(event.id) ? 'Hide' : 'Show'} raw data
 									</button>
+
 									{#if expandedEvents.has(event.id)}
-										<div class="mt-2 text-sm bg-surface-500/10 rounded p-3 border border-surface-500/20">
-											<pre class="text-xs overflow-x-auto whitespace-pre-wrap font-mono">{JSON.stringify(event.data, null, 2)}</pre>
+										<div class="mt-2 rounded-lg bg-surface-900 border border-surface-700 p-3 space-y-3">
+											{#if event.data?.full_log || event.data?.raw_log || event.data?.raw}
+												{@const rawLog = String(event.data.full_log || event.data.raw_log || event.data.raw)}
+												<div class="flex items-center justify-between pb-2 border-b border-surface-700">
+													<span class="text-xs font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+														<span class="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+														Raw Wazuh Telemetry (full_log)
+													</span>
+													<button
+														type="button"
+														on:click={() => copyToClipboard(rawLog, event.id)}
+														class="btn btn-sm variant-soft-primary text-xs py-1 px-2.5"
+													>
+														{copiedLogId === event.id ? '✅ Copied to Clipboard!' : '📋 Copy Log'}
+													</button>
+												</div>
+												<pre class="overflow-x-auto rounded bg-black/60 p-3 font-mono text-xs text-emerald-400 whitespace-pre-wrap selection:bg-emerald-900 selection:text-white border border-surface-700">{rawLog}</pre>
+											{/if}
+
+											<details open={!event.data?.full_log && !event.data?.raw_log && !event.data?.raw}>
+												<summary class="text-xs text-surface-400 cursor-pointer hover:text-surface-200 font-medium">
+													Structured Event Metadata JSON
+												</summary>
+												<pre class="mt-2 text-xs overflow-x-auto whitespace-pre-wrap font-mono text-surface-300 bg-black/40 p-3 rounded border border-surface-700/60">{JSON.stringify(event.data, null, 2)}</pre>
+											</details>
 										</div>
 									{/if}
 								</div>
@@ -616,7 +630,6 @@
 	</div>
 {/if}
 
-<!-- Cancel Modal -->
 {#if showCancelModal}
 	<div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
 		<div class="card p-6 w-full max-w-md m-4">
@@ -638,16 +651,16 @@
 				>
 					Keep Investigation
 				</button>
-					<button
-						class="btn variant-filled-error"
-						disabled={actionLoading}
-						on:click={handleCancel}
-					>
-						{#if actionLoading}
-							<span class="inline-block animate-spin rounded-full h-4 w-4 border-b-2 border-current mr-2"></span>
-						{/if}
-						Cancel Investigation
-					</button>
+				<button
+					class="btn variant-filled-error"
+					disabled={actionLoading}
+					on:click={handleCancel}
+				>
+					{#if actionLoading}
+						<span class="inline-block animate-spin rounded-full h-4 w-4 border-b-2 border-current mr-2"></span>
+					{/if}
+					Cancel Investigation
+				</button>
 			</div>
 		</div>
 	</div>

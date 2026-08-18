@@ -469,11 +469,12 @@ async def promote_alert_to_case(
     to the investigation before the first LLM look.
     """
 
+    # 1. Fetch all alert fields including full_log in a single query
     alert = (
         await db.execute(
             text(
                 "SELECT source, rule_id, severity, asset_ids, initial_iocs, "
-                "       source_event_ids, ai_confidence, first_event_at "
+                "       source_event_ids, ai_confidence, first_event_at, full_log "
                 "FROM alerts WHERE id = :id"
             ),
             {"id": str(alert_id)},
@@ -571,7 +572,7 @@ async def promote_alert_to_case(
     # Start a run for the investigation (delayed by the settle window).
     run_id = await start_run(db, tenant_id, investigation_id, settle_seconds=settle_seconds)
 
-    # Emit alert_ingested event so the reducer seeds the hypothesis.
+    # 2. Emit alert_ingested event with full_log directly
     await append_event(
         db,
         tenant_id=tenant_id,
@@ -587,6 +588,7 @@ async def promote_alert_to_case(
             "severity": alert["severity"],
             "ai_confidence": alert["ai_confidence"],
             "initial_hypothesis": "under_investigation",
+            "full_log": alert.get("full_log") or "",
         },
         producer="triage",
     )
@@ -693,7 +695,7 @@ async def auto_close_alert(
         await db.execute(
             text(
                 "SELECT rule_id, severity, asset_ids, initial_iocs, "
-                "       first_event_at, source "
+                "       first_event_at, source, full_log "
                 "FROM alerts WHERE id = :id"
             ),
             {"id": str(alert_id)},

@@ -1,20 +1,16 @@
 # =============================================================================
 # SocTalk Frontend - Multi-stage production build (adapter-node)
 # =============================================================================
-#
-# The frontend uses ``@sveltejs/adapter-node`` (see frontend/svelte.config.js)
-# so the build output is a Node.js server, not a static site. Earlier
-# revisions of this Dockerfile used nginx to serve a static ``build/``
-# directory; that broke the moment the project switched adapters because
-# adapter-node emits ``index.js``/``handler.js`` rather than HTML. nginx
-# then served the build directory, hit "directory index forbidden", and
-# the chart's readiness probe stayed 0/1 forever.
-#
-# Same shape as ``soctalk-cloud/Dockerfile.frontend``.
 
 FROM node:20-alpine AS builder
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+
+# Disable SSL verification for corporate proxy / VPN SSL inspection
+ENV NODE_TLS_REJECT_UNAUTHORIZED=0
+
+RUN npm config set strict-ssl false && \
+    npm install -g pnpm@9.15.0 && \
+    pnpm config set strict-ssl false
 
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
@@ -28,15 +24,10 @@ COPY --from=builder /app/build ./build
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./package.json
 
-# Port 3000 matches the chart's containerPort + readinessProbe
-# (charts/soctalk-system/templates/40-frontends.yaml).
 ENV PORT=3000 \
     HOST=0.0.0.0 \
     NODE_ENV=production
 
-# Drop privileges. Chart's pod securityContext sets runAsUser=10001;
-# create a matching user so node can write to /app for runtime
-# tempfiles without permission errors.
 RUN addgroup -S -g 10001 svelte \
     && adduser -S -u 10001 -G svelte svelte \
     && chown -R svelte:svelte /app
