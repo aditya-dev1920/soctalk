@@ -20,6 +20,9 @@
 	let expandedEvents: Set<string> = new Set();
 	let copiedLogId: string | null = null;
 
+	// Safe reactive extraction for Jira Key without in-template TypeScript casting
+	$: jiraIssueKey = (investigation as Record<string, any> | null)?.jira_issue_key;
+
 	function toggleEventDetails(eventId: string) {
 		if (expandedEvents.has(eventId)) {
 			expandedEvents.delete(eventId);
@@ -32,7 +35,7 @@
 	function copyToClipboard(text: string, id: string) {
 		navigator.clipboard.writeText(text);
 		copiedLogId = id;
-		addToast({ type: 'success', message: 'Raw log copied to clipboard for Jira!' });
+		addToast({ type: 'success', message: 'Copied to clipboard!' });
 		setTimeout(() => {
 			if (copiedLogId === id) copiedLogId = null;
 		}, 2500);
@@ -41,12 +44,18 @@
 	function formatEventSummary(eventType: string, data: Record<string, unknown>): string {
 		switch (eventType) {
 			case 'alert_ingested':
-        	case 'alert.ingested':
-        	case 'alert.added': {
-            	const ruleDesc = data.description || data.title || (data.rule_id ? `Rule ${data.rule_id}` : 'Wazuh Alert');
-            	const count = data.event_count ? ` (${data.event_count} events coalesced)` : '';
-            	return `Alert Ingested: ${ruleDesc}${count}`;
-        	}
+			case 'alert.ingested':
+			case 'alert.added': {
+				let titleText = String(data.rule_description || data.description || data.title || '');
+				const isRawLog = !titleText || titleText === data.full_log || /^\d{4}-\d{2}-\d{2}/.test(titleText);
+				
+				if (isRawLog) {
+					titleText = data.rule_id ? `Rule ${data.rule_id}` : 'Wazuh Alert';
+				}
+				
+				const count = data.event_count && Number(data.event_count) > 1 ? ` (${data.event_count} events coalesced)` : '';
+				return `Alert Ingested: ${titleText}${count}`;
+			}
 			case 'investigation.created':
 				return `Investigation started: "${data.title || 'Untitled'}"`;
 			case 'investigation.started':
@@ -63,8 +72,6 @@
 				return `Investigation escalated to incident response`;
 			case 'investigation.auto_closed':
 				return `Investigation auto-closed (no threats found)`;
-			case 'alert.added':
-				return `Alert added: ${data.alert_id || 'Unknown'}`;
 			case 'alert.correlated':
 				return `Alert correlated: ${data.description || data.alert_id || 'Unknown alert'}`;
 			case 'observable.extracted':
@@ -109,8 +116,8 @@
 		}
 	}
 
-	function getEventDetails(eventType: string, data: Record<string, unknown>): Array<{label: string, value: string, highlight?: boolean}> {
-		const details: Array<{label: string, value: string, highlight?: boolean}> = [];
+	function getEventDetails(eventType: string, data: Record<string, unknown>): Array<{label: string, value: string, highlight?: boolean, tooltip?: string}> {
+		const details: Array<{label: string, value: string, highlight?: boolean, tooltip?: string}> = [];
 
 		switch (eventType) {
 			case 'alert_ingested':
@@ -129,10 +136,18 @@
 					if (mitreIds.length > 0) details.push({ label: 'MITRE', value: mitreIds.join(', ') });
 				}
 				if (data.rule_groups && Array.isArray(data.rule_groups) && data.rule_groups.length > 0) {
-					details.push({ label: 'Groups', value: (data.rule_groups as string[]).join(', ') });
+					const groups = data.rule_groups as string[];
+					const displayGroups = groups.length > 2 
+						? `${groups.slice(0, 2).join(', ')} (+${groups.length - 2} more)` 
+						: groups.join(', ');
+					details.push({ 
+						label: 'Groups', 
+						value: displayGroups,
+						tooltip: groups.join(', ')
+					});
 				}
 				if (data.initial_iocs && Array.isArray(data.initial_iocs) && data.initial_iocs.length > 0) {
-					const iocVals = data.initial_iocs.map((i: any) => i.value || i).filter(Boolean);
+					const iocVals = (data.initial_iocs as any[]).map((i: any) => (typeof i === 'object' && i !== null ? i.value : i)).filter(Boolean);
 					if (iocVals.length > 0) details.push({ label: 'IOCs', value: iocVals.join(', '), highlight: true });
 				}
 				if (data.source_event_id) details.push({ label: 'Event ID', value: String(data.source_event_id) });
@@ -143,11 +158,6 @@
 				if (data.source_ip) details.push({ label: 'Source IP', value: String(data.source_ip) });
 				if (data.source_agent) details.push({ label: 'Agent', value: String(data.source_agent) });
 				if (data.max_severity) details.push({ label: 'Severity', value: String(data.max_severity).toUpperCase(), highlight: true });
-				break;
-			case 'alert.correlated':
-				if (data.rule_id) details.push({ label: 'Rule ID', value: String(data.rule_id) });
-				if (data.severity) details.push({ label: 'Severity', value: String(data.severity).toUpperCase(), highlight: true });
-				if (data.description) details.push({ label: 'Description', value: String(data.description) });
 				break;
 			case 'observable.extracted':
 				if (data.classification) details.push({ label: 'Classification', value: String(data.classification) });
@@ -236,6 +246,9 @@
 			case 'paused': return 'variant-soft-tertiary';
 			case 'closed':
 			case 'auto_closed':
+			case 'auto_closed_fp':
+			case 'closed_fp':
+			case 'closed_tp':
 				return 'variant-soft-success';
 			case 'escalated':
 			case 'rejected':
@@ -246,7 +259,13 @@
 		}
 	}
 
-	function getSeverityBadge(severity: string | null): string {
+	function getSeverityBadge(severity: string | number | null): string {
+		if (typeof severity === 'number') {
+			if (severity >= 12) return 'variant-filled-error';
+			if (severity >= 8) return 'variant-filled-warning';
+			if (severity >= 4) return 'variant-filled-secondary';
+			return 'variant-filled-tertiary';
+		}
 		switch (severity?.toLowerCase()) {
 			case 'critical': return 'variant-filled-error';
 			case 'high': return 'variant-filled-warning';
@@ -276,6 +295,8 @@
 			case 'investigation.closed':
 				return 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z';
 			case 'alert.added':
+			case 'alert_ingested':
+			case 'alert.ingested':
 				return 'M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z';
 			case 'observable.extracted':
 				return 'M15 12a3 3 0 11-6 0 3 3 0 016 0z M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z';
@@ -369,7 +390,7 @@
 				<button
 					class="btn variant-soft-error"
 					disabled={actionLoading}
-					on:click={() => showCancelModal = true}
+					on:click={() => (showCancelModal = true)}
 				>
 					<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
 						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
@@ -413,6 +434,10 @@
 				<h3 class="h4 mb-4">Details</h3>
 				<dl class="space-y-2">
 					<div class="flex justify-between">
+						<dt class="opacity-60">Short ID</dt>
+						<dd class="font-mono text-xs font-bold text-primary-400">{investigation.short_id || investigation.id.slice(0, 8)}</dd>
+					</div>
+					<div class="flex justify-between">
 						<dt class="opacity-60">ID</dt>
 						<dd class="font-mono text-xs">{investigation.id.slice(0, 8)}...</dd>
 					</div>
@@ -428,6 +453,12 @@
 						<div class="flex justify-between">
 							<dt class="opacity-60">Closed</dt>
 							<dd>{new Date(investigation.closed_at).toLocaleString()}</dd>
+						</div>
+					{/if}
+					{#if jiraIssueKey}
+						<div class="flex justify-between">
+							<dt class="opacity-60">Jira Ticket</dt>
+							<dd class="badge variant-filled-primary font-mono">{jiraIssueKey}</dd>
 						</div>
 					{/if}
 					{#if investigation.thehive_case_id}
@@ -598,12 +629,15 @@
 									<p class="text-sm font-medium mb-2">{formatEventSummary(event.event_type, event.data)}</p>
 
 									{#if details.length > 0}
-										<div class="flex flex-wrap gap-x-4 gap-y-1 text-xs mb-2">
+										<div class="flex flex-wrap gap-1.5 text-xs mb-3">
 											{#each details as detail}
-												{#if detail.label}
-													<span class="opacity-60">{detail.label}:</span>
-												{/if}
-												<span class={detail.highlight ? 'text-error-500 font-semibold' : ''}>{detail.value}</span>
+												<span
+													class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-surface-800 border border-surface-700 {detail.tooltip ? 'cursor-help' : ''}"
+													title={detail.tooltip || detail.value}
+												>
+													<span class="opacity-50 font-medium">{detail.label}:</span>
+													<span class={detail.highlight ? 'text-error-400 font-semibold' : 'text-surface-200'}>{detail.value}</span>
+												</span>
 											{/each}
 										</div>
 									{/if}
