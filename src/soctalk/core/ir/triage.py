@@ -462,19 +462,14 @@ async def promote_alert_to_case(
     title: str | None = None,
     settle_seconds: float = 0.0,
 ) -> UUID:
-    """Create an investigation from an alert, emit alert_ingested, start a run.
+    """Create an investigation from an alert, emit alert_ingested, start a run."""
 
-    ``settle_seconds`` delays the run's claimability (issue #28 settle
-    window) so correlated events landing right after this promotion attach
-    to the investigation before the first LLM look.
-    """
-
-    # 1. Fetch all alert fields including full_log in a single query
+    # 1. Fetch alert metadata and raw telemetry from alert_source_events
     alert = (
         await db.execute(
             text(
                 "SELECT source, rule_id, severity, asset_ids, initial_iocs, "
-                "       source_event_ids, ai_confidence, first_event_at, full_log "
+                "       source_event_ids, ai_confidence, first_event_at, full_log, description "
                 "FROM alerts WHERE id = :id"
             ),
             {"id": str(alert_id)},
@@ -483,10 +478,18 @@ async def promote_alert_to_case(
     if alert is None:
         raise ValueError(f"alert {alert_id} not found")
 
-    # Initial visibility per install/tenant policy. ``auto`` mode
-    # makes the investigation visible to the tenant immediately (right default
-    # for the wholesale flow); ``explicit`` / ``disabled`` keep it
-    # ``mssp_only`` until an analyst promotes it.
+    source_event = (
+        await db.execute(
+            text(
+                "SELECT description_redacted, full_log_redacted, entities, mitre, rule_groups "
+                "FROM alert_source_events WHERE alert_id = :id "
+                "ORDER BY occurred_at DESC LIMIT 1"
+            ),
+            {"id": str(alert_id)},
+        )
+    ).mappings().first()
+
+    # Initial visibility per install/tenant policy
     policy = await effective_policy(db, tenant_id)
     initial_visibility = (
         "customer_safe"
@@ -525,7 +528,6 @@ async def promote_alert_to_case(
             continue
         fp = ioc_fingerprint(ioc["type"], ioc["value"])
         ioc_id = uuid4()
-        # Upsert the IOC (tenant-scoped).
         await db.execute(
             text(
                 """
@@ -545,7 +547,6 @@ async def promote_alert_to_case(
                 "fp": fp,
             },
         )
-        # Re-read the id (might be existing).
         existing = (
             await db.execute(
                 text("SELECT id FROM iocs WHERE tenant_id = :t AND fingerprint = :f"),
@@ -572,7 +573,7 @@ async def promote_alert_to_case(
     # Start a run for the investigation (delayed by the settle window).
     run_id = await start_run(db, tenant_id, investigation_id, settle_seconds=settle_seconds)
 
-    # 2. Emit alert_ingested event with full_log directly
+    # 2. Emit alert_ingested event with full structured telemetry
     await append_event(
         db,
         tenant_id=tenant_id,
@@ -588,7 +589,11 @@ async def promote_alert_to_case(
             "severity": alert["severity"],
             "ai_confidence": alert["ai_confidence"],
             "initial_hypothesis": "under_investigation",
-            "full_log": alert.get("full_log") or "",
+            "full_log": (source_event["full_log_redacted"] if source_event else None) or alert.get("full_log") or "",
+            "description": (source_event["description_redacted"] if source_event else None) or alert.get("description") or "",
+            "mitre": (source_event["mitre"] if source_event else None) or {},
+            "entities": (source_event["entities"] if source_event else None) or [],
+            "rule_groups": (source_event["rule_groups"] if source_event else None) or [],
         },
         producer="triage",
     )
@@ -897,6 +902,11 @@ async def triage_event(
                 "rule_id": rule_id,
                 "severity": severity,
                 "asset_ids": asset_ids,
+                "full_log": evidence.get("full_log") or "",
+                "description": description or "",
+                "mitre": evidence.get("mitre") or {},
+                "entities": evidence.get("entities") or [],
+                "rule_groups": evidence.get("rule_groups") or [],
             },
             idempotency_key=f"attach-{alert_id}-{source_event_id}",
             producer="triage",
@@ -976,6 +986,11 @@ async def triage_event(
                     "rule_id": rule_id,
                     "severity": severity,
                     "asset_ids": asset_ids,
+                    "full_log": evidence.get("full_log") or "",
+                    "description": description or "",
+                    "mitre": evidence.get("mitre") or {},
+                    "entities": evidence.get("entities") or [],
+                    "rule_groups": evidence.get("rule_groups") or [],
                 },
                 idempotency_key=f"corr-{alert_id}-{source_event_id}",
                 producer="triage",

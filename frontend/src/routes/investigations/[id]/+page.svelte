@@ -40,6 +40,13 @@
 
 	function formatEventSummary(eventType: string, data: Record<string, unknown>): string {
 		switch (eventType) {
+			case 'alert_ingested':
+        	case 'alert.ingested':
+        	case 'alert.added': {
+            	const ruleDesc = data.description || data.title || (data.rule_id ? `Rule ${data.rule_id}` : 'Wazuh Alert');
+            	const count = data.event_count ? ` (${data.event_count} events coalesced)` : '';
+            	return `Alert Ingested: ${ruleDesc}${count}`;
+        	}
 			case 'investigation.created':
 				return `Investigation started: "${data.title || 'Untitled'}"`;
 			case 'investigation.started':
@@ -106,6 +113,24 @@
 		const details: Array<{label: string, value: string, highlight?: boolean}> = [];
 
 		switch (eventType) {
+			case 'alert_ingested':
+        	case 'alert.ingested':
+        	case 'alert.added':
+        	case 'alert.correlated':
+				if (data.rule_id) details.push({ label: 'Rule ID', value: String(data.rule_id) });
+				if (data.severity) details.push({ label: 'Severity', value: String(data.severity).toUpperCase(), highlight: Number(data.severity) >= 8 });
+				if (data.event_count && Number(data.event_count) > 1) details.push({ label: 'Coalesced Count', value: `${data.event_count}x` });
+				if (data.asset_ids && Array.isArray(data.asset_ids) && data.asset_ids.length > 0) {
+					details.push({ label: 'Assets', value: (data.asset_ids as string[]).join(', ') });
+            }
+            if (data.mitre && typeof data.mitre === 'object') {
+                const mitreObj = data.mitre as Record<string, unknown>;
+                const mitreIds = (mitreObj.ids as string[]) || (mitreObj.id ? [String(mitreObj.id)] : []);
+                if (mitreIds.length > 0) details.push({ label: 'MITRE', value: mitreIds.join(', ') });
+            }
+            if (data.source_event_id) details.push({ label: 'Event ID', value: String(data.source_event_id) });
+            break;
+
 			case 'investigation.created':
 				if (data.alert_ids) details.push({ label: 'Alerts', value: `${(data.alert_ids as string[]).length} alerts` });
 				if (data.source_ip) details.push({ label: 'Source IP', value: String(data.source_ip) });
