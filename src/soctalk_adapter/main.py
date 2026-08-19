@@ -10,6 +10,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import FastAPI
@@ -25,7 +26,7 @@ from soctalk_wire import (
 logger = logging.getLogger("soctalk.adapter")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # Startup durable-checkpoint load: retry with a freshly read token so a token
 # renewed just after pod start (see token_renewal) is picked up before we
@@ -153,15 +154,16 @@ def _wazuh_indexer_verify_ssl() -> bool:
 
 
 def _soctalk_api_verify_ssl() -> bool:
-    """Resolve TLS verification for the SocTalk L1 (MSSP) API httpx clients.
+    """Resolve TLS verification for the Soctalk API httpx client.
 
-    Reads ``SOCTALK_API_VERIFY_SSL`` (default ``"true"``) with the same
-    spelling rules as ``WAZUH_INDEXER_VERIFY_SSL``. The provisioning controller
-    sets this to ``"false"`` for cross-cluster tenants whose L1 serves a
-    self-signed cert (launchpad demo / pending launchpad-owned certs): the
-    adapter must reach L1 to heartbeat and forward alerts, so a self-signed L1
-    can opt out of verification explicitly. A malformed value fails safe to
-    verify=True — a typo must never silently disable TLS against L1.
+    Reads ``SOCTALK_API_VERIFY_SSL`` (default ``"true"``). Recognises the
+    canonical spellings ``true``/``1`` (verify ON) and ``false``/``0`` (verify
+    OFF), case-insensitive and whitespace-trimmed. Any other value is
+    malformed: log a warning and fail safe to verification ON — a typo must
+    never silently disable TLS verification against the API. The chart
+    feeds this from ``IntegrationConfig.soctalk_verify_ssl`` so a tenant whose
+    external (or in-cluster self-signed) API needs ``verify=False`` can
+    opt out explicitly.
     """
     raw = os.environ.get("SOCTALK_API_VERIFY_SSL", "true")
     normalized = raw.strip().lower()
@@ -295,7 +297,7 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
     """
     ents: list[dict] = []
 
-    def add(t: str, v, role: str | None, field: str) -> None:
+    def add(t: str, v: Any, role: str | None, field: str) -> None:
         if v is None:
             return
         s = str(v).strip()
@@ -316,7 +318,27 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
         add("port", data.get("srcport"), "src", "data.srcport")
         add("port", data.get("dstport"), "dst", "data.dstport")
         add("process", data.get("process") or data.get("command"), "actor", "data.process")
-    # dedupe on (type, value, role)
+
+        # Windows EventData extraction
+        win = data.get("win") or {}
+        if isinstance(win, dict):
+            ev_data = win.get("eventdata") or {}
+            if isinstance(ev_data, dict):
+                add("user", ev_data.get("targetUserName") or ev_data.get("subjectUserName"), "target", "win.eventdata.user")
+                add("process", ev_data.get("image") or ev_data.get("parentImage"), "actor", "win.eventdata.image")
+                add("ip", ev_data.get("sourceIp"), "src", "win.eventdata.sourceIp")
+                add("ip", ev_data.get("destinationIp"), "dst", "win.eventdata.destinationIp")
+
+        # Vulnerability Detector extraction
+        vuln = data.get("vulnerability")
+        if isinstance(vuln, dict):
+            cve = vuln.get("id") or vuln.get("cve")
+            if cve:
+                add("vulnerability", cve, "target", "data.vulnerability.cve")
+            pkg = vuln.get("package", {}).get("name") if isinstance(vuln.get("package"), dict) else vuln.get("package")
+            if pkg:
+                add("package", pkg, "target", "data.vulnerability.package.name")
+
     seen: set[tuple] = set()
     out: list[dict] = []
     for e in ents:
@@ -328,31 +350,89 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
 
 
 def _extract_mitre(rule: dict) -> dict:
-    """Pull MITRE ATT&CK refs from the rule (issue #17 fix 2)."""
     mitre = rule.get("mitre") or {}
-    if not isinstance(mitre, dict):
-        return {}
-    def _cap(v):
-        return [str(x)[:32] for x in (v or [])][:16]
-    out = {
-        
-        #### Mitre data captured in initial triage stage for alert details
-        "ids": _cap(mitre.get("id")),
-        "tactics": _cap(mitre.get("tactic")),
-        "techniques": _cap(mitre.get("technique")),
+    groups = [str(g).lower() for g in (rule.get("groups") or [])]
+
+    ids: list[str] = []
+    tactics: list[str] = []
+    techniques: list[str] = []
+
+    if isinstance(mitre, dict) and any(mitre.values()):
+        def _cap(v: Any) -> list[str]:
+            if isinstance(v, list):
+                return [str(x)[:32] for x in v][:16]
+            if v:
+                return [str(v)[:32]]
+            return []
+        ids = _cap(mitre.get("id"))
+        tactics = _cap(mitre.get("tactic"))
+        techniques = _cap(mitre.get("technique"))
+
+    # Dynamic fallback heuristics for unmapped rules
+    if not ids:
+        if "vulnerability-detector" in groups:
+            ids = ["T1190"]
+            tactics = ["initial-access"]
+            techniques = ["Exploit Public-Facing Application"]
+        elif "postgresql_dam" in groups or "postgresql" in groups:
+            ids = ["T1078", "T1190"]
+            tactics = ["initial-access", "credential-access"]
+            techniques = ["Valid Accounts", "Exploit Public-Facing Application"]
+        elif "sysmon" in groups or "windows" in groups:
+            ids = ["T1059"]
+            tactics = ["execution"]
+            techniques = ["Command and Scripting Interpreter"]
+        elif "authentication_failed" in groups or "sshd" in groups:
+            ids = ["T1110"]
+            tactics = ["credential-access"]
+            techniques = ["Brute Force"]
+
+    return {
+        "ids": ids,
+        "tactics": tactics,
+        "techniques": techniques,
     }
-    return out if any(out.values()) else {}
+
+
+def _extract_full_log(src: dict, rule: dict) -> str:
+    data = src.get("data") or {}
+
+    # 1. Direct root or nested full_log / raw string
+    if src.get("full_log"):
+        return str(src["full_log"])
+    if isinstance(data, dict):
+        if data.get("full_log"):
+            return str(data["full_log"])
+        if data.get("raw"):
+            return str(data["raw"])
+        win_cmd = (data.get("win") or {}).get("eventdata", {}).get("commandLine")
+        if win_cmd:
+            return str(win_cmd)
+        audit_cmd = (data.get("audit") or {}).get("command")
+        if audit_cmd:
+            return str(audit_cmd)
+
+        # 2. Vulnerability Findings
+        vuln = data.get("vulnerability")
+        if isinstance(vuln, dict):
+            cve = vuln.get("id") or vuln.get("cve") or "Vulnerability"
+            pkg = vuln.get("package", {}).get("name") if isinstance(vuln.get("package"), dict) else vuln.get("package", "")
+            ver = vuln.get("package", {}).get("version") if isinstance(vuln.get("package"), dict) else ""
+            title = vuln.get("title") or ""
+            return f"{cve} affecting {pkg} {ver} - {title}".strip(" -")
+
+    # 3. Fallback to rule description
+    return str(rule.get("description") or "")
 
 
 def _hit_to_event(hit: dict) -> dict | None:
     src = hit.get("_source") or {}
-    source_id = src.get("id") or hit.get("_id")  ## Wazuh Alert ID captured in Alert details
+    source_id = src.get("id") or hit.get("_id")
     if not source_id:
         return None
     rule = src.get("rule") or {}
     agent = src.get("agent") or {}
-    full_log = src.get("full_log") or ""
-    rule_desc = rule.get("description") or "" #### Description from Wazuh alert captured in initial triage stage for alert details
+    rule_desc = rule.get("description") or ""
     agent_name = agent.get("name") if isinstance(agent, dict) else None
     asset_ids: list[str] = []
     if isinstance(agent, dict) and agent.get("id"):
@@ -360,28 +440,21 @@ def _hit_to_event(hit: dict) -> dict | None:
     if agent_name:
         asset_ids.append(agent_name[:64])
 
-    # IOC extraction reads the RAW text (must run before redaction).
-    iocs = _extract_iocs(f"{rule_desc} {full_log}") ## automatically parses routable IPv4 addresses, domains, SHA256, and MD5 hashes from raw log text.
+    full_log = _extract_full_log(src, rule)
+    iocs = _extract_iocs(f"{rule_desc} {full_log}")
     entities = _extract_entities(src, agent, agent_name)
 
-    # Redaction (issue #17 fix 9): strip secrets from every outbound text
-    # path AFTER IOC extraction, BEFORE anything leaves the tenant. Redact
-    # on the FULL text, THEN truncate — truncating first could cut a
-    # multi-line secret (e.g. a PEM block) before its END marker so the
-    # pattern never matches.
-    full_log_red = redact_text(full_log)[:4096] if full_log else ""   ## Full log data from wazuh for alert details redacted 40% to remove if some secrets are present in the log
+    full_log_red = redact_text(full_log)[:4096] if full_log else ""
     rule_desc_red = redact_text(rule_desc)[:512] if rule_desc else ""
-    description = redact_text((full_log or rule_desc).strip())[:1024] or None
+    description = rule_desc_red or redact_text(full_log.strip())[:1024] or None
     title = redact_text(
         _compose_title(rule_desc, agent_name, _extract_subject(full_log))
     )
-    # Template hash over REDACTED text: masking secrets out of the hash
-    # keeps the fingerprint secret-free AND stable when only a secret varies.
     thash = template_hash(full_log_red)
 
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     return {
-        "source_event_id": str(source_id)[:128], ## Wazuh Alert ID captured in Alert details
+        "source_event_id": str(source_id)[:128],
         "source": "wazuh",
         "rule_id": (str(rule.get("id"))[:64] if rule.get("id") else None),
         "severity": _severity_from_rule_level(rule.get("level")),
@@ -391,12 +464,11 @@ def _hit_to_event(hit: dict) -> dict | None:
         "observed_at": now_iso,
         "description": description,
         "title": title,
-        # v2 evidence sidecar
         "entities": entities,
         "mitre": _extract_mitre(rule),
         "rule_groups": [str(g)[:64] for g in (rule.get("groups") or [])][:16],
-        "decoder": (src.get("decoder") or {}).get("name"),  ## Decoder name for wazuh alert details
-        "full_log": full_log_red, #### Full log data from wazuh for alert details
+        "decoder": (src.get("decoder") or {}).get("name"),
+        "full_log": full_log_red,
         "template_hash": thash,
         "template_version": TEMPLATE_VERSION,
         "redaction_version": REDACTION_VERSION,
@@ -404,7 +476,7 @@ def _hit_to_event(hit: dict) -> dict | None:
             "rule_description": rule_desc_red,
             "rule_groups": rule.get("groups") or [],
             "decoder_name": (src.get("decoder") or {}).get("name"),
-            "location": src.get("location"), ## Wazuh alert location captured in alert details for DECODER 
+            "location": src.get("location"),
             "manager_name": (src.get("manager") or {}).get("name"),
             "full_log": full_log_red,
         },
@@ -416,7 +488,7 @@ def _min_severity() -> int:
     try:
         v = int(raw)
     except ValueError:
-        return 10
+        return 5
     return max(0, min(15, v))
 
 
@@ -424,25 +496,13 @@ async def _query_alerts(
     client: httpx.AsyncClient, since_ts: str, since_id: str | None, limit: int
 ) -> list[dict]:
     user, pw = _wazuh_indexer_creds()
-    # Keyset pagination (issue #17 fix 6): sort by (@timestamp, id) and use
-    # ``search_after`` so a page that ends mid-timestamp resumes exactly
-    # after the last event — no skipping same-timestamp events, and no
-    # livelock when more than ``limit`` alerts share one timestamp. Re-reads
-    # are still absorbed by the control-plane idempotency constraint.
     filters: list[dict] = [
         {"range": {"@timestamp": {"gte": since_ts}}},
-        {"range": {"rule.level": {"gte": _min_severity()}}}, ## Range level data captured in alert details for severity filtering
+        {"range": {"rule.level": {"gte": _min_severity()}}},
     ]
     must_not: list[dict] = []
-    # By default the Wazuh manager pod's agent (id 000) flood-generates
-    # FIM/monitord self-alerts (rules 510/550/553/...) that aren't
-    # security signals. Default behaviour is to skip them; flip the
-    # env var to "0" to ingest manager-self alerts too.
     if os.environ.get("SOCTALK_ADAPTER_EXCLUDE_MANAGER_AGENT", "1") in {"1", "true"}:
-        must_not.append({"term": {"agent.id": "000"}}) #
-    # Optional allowlist by agent.name prefix — when set, only agents
-    # whose name starts with the prefix are ingested. Useful to scope
-    # ingestion to docker-based endpoints like ``linux-ep-*``.
+        must_not.append({"term": {"agent.id": "000"}})
     prefix = os.environ.get("SOCTALK_ADAPTER_AGENT_PREFIX")
     if prefix:
         filters.append({"prefix": {"agent.name": prefix}})
@@ -451,8 +511,6 @@ async def _query_alerts(
         bool_query["must_not"] = must_not
     body: dict = {
         "size": limit,
-        # id.keyword is the stable secondary sort so ``search_after`` gives a
-        # total order across equal timestamps.
         "sort": [{"@timestamp": {"order": "asc"}}, {"id": {"order": "asc"}}],
         "query": {"bool": bool_query},
     }
@@ -518,9 +576,6 @@ async def _heartbeat_once(client: httpx.AsyncClient) -> None:
     api_url = os.environ["SOCTALK_API_URL"].rstrip("/")
     tenant_id = os.environ["SOCTALK_TENANT_ID"]
     token = _read_token()
-    # Coverage metrics on the heartbeat (issue #17 fix 10, Alertmanager-style
-    # loss accounting): the control plane can tell a quiet tenant from a
-    # dropping one, and see ingest throughput without a separate channel.
     metrics = {
         "alerts_queried": _state.alerts_queried,
         "alerts_forwarded": _state.alerts_forwarded,
@@ -559,31 +614,18 @@ async def _ingest_loop() -> None:
     if os.environ.get("SOCTALK_INGEST_DISABLED", "0") in {"1", "true"}:
         logger.info("ingest_disabled")
         return
-    interval = float(os.environ.get("SOCTALK_INGEST_INTERVAL_SECONDS", "60"))
+    interval = float(os.environ.get("SOCTALK_INGEST_INTERVAL_SECONDS", "30"))
     batch_size = int(os.environ.get("SOCTALK_INGEST_BATCH_SIZE", "100"))
     api_url = os.environ["SOCTALK_API_URL"].rstrip("/")
     tenant_id = os.environ["SOCTALK_TENANT_ID"]
     token = _read_token()
 
-    # TLS verification against the indexer is tenant-controlled via
-    # WAZUH_INDEXER_VERIFY_SSL (default on); resolved once here instead of the
-    # former hard-coded verify=False so externally-provided CA-signed indexers
-    # are verified while self-signed in-cluster ones can opt out.
     verify_indexer_tls = _wazuh_indexer_verify_ssl()
     verify_api_tls = _soctalk_api_verify_ssl()
     async with (
         httpx.AsyncClient(verify=verify_api_tls) as api_client,
         httpx.AsyncClient(verify=verify_indexer_tls) as wazuh_client,
     ):
-        # Durable checkpoint resume (issue #17 fix 6): pull the server-side
-        # cursor once at start so a pod restart continues instead of
-        # replaying from the in-memory initial cursor.
-        # Load the durable cursor BEFORE ingesting, retrying with a freshly
-        # read token each attempt. If the pod started with an about-to-expire
-        # token that the control plane then renewed, the first load 401s;
-        # proceeding from the local (epoch/now) cursor would replay weeks of
-        # alerts or skip history. Retry so we resume from the true checkpoint
-        # once the renewed token projects into the mounted Secret (~60s).
         for _attempt in range(CHECKPOINT_LOAD_MAX_ATTEMPTS):
             await _load_checkpoint(api_client, api_url, tenant_id, _read_token())
             if _state.checkpoint_loaded:
@@ -595,9 +637,6 @@ async def _ingest_loop() -> None:
                 CHECKPOINT_LOAD_MAX_ATTEMPTS,
             )
         while True:
-            # Re-read the token each cycle so a renewed ``adapter-token`` Secret
-            # (the control plane re-mints it before the TTL elapses) is picked
-            # up without a pod restart — the mounted file updates in place.
             token = _read_token()
             try:
                 hits = await _query_alerts(
@@ -610,11 +649,7 @@ async def _ingest_loop() -> None:
                         ev = _hit_to_event(h)
                         if ev is not None:
                             events.append(ev)
-                    # Keyset cursor: the resume point is the LAST hit's
-                    # (ts, id) regardless of whether the timestamp advanced.
-                    # This is what breaks the same-timestamp livelock — the
-                    # id tie-breaker always moves forward even when many
-                    # alerts share one timestamp.
+
                     new_cursor_ts = _state.last_alert_ts
                     new_cursor_id = _state.last_alert_id
                     if events:
@@ -622,9 +657,6 @@ async def _ingest_loop() -> None:
                         new_cursor_ts = last["ts"] or new_cursor_ts
                         new_cursor_id = last["source_event_id"]
 
-                    # Per-tenant rate limit — drop the tail past the bucket
-                    # capacity. The cursor still advances past dropped events
-                    # (shedding, not deferral); drops are recorded as facts.
                     if events:
                         allowed, dropped = _rate_limiter.take(len(events))
                         if dropped > 0:
@@ -701,9 +733,6 @@ async def live() -> dict:
 
 @app.get("/health/ready")
 async def ready() -> dict:
-    # Ready as soon as the server is up; heartbeat + ingest status are
-    # informational. The chart's readiness probe just needs the process
-    # to be serving HTTP.
     return {
         "ok": True,
         "last_heartbeat_ok": _state.last_heartbeat_ok.isoformat()
