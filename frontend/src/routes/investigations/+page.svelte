@@ -1,25 +1,32 @@
-	<script lang="ts">
-		import { onMount } from 'svelte';
-		import { api, type InvestigationSummary } from '$lib/api/client';
-		import { authSession, isMsspScope } from '$lib/stores';
-		import { formatStatus, formatPhase, formatSeverity, formatDecision } from '$lib/utils/formatters';
+<script lang="ts">
+	import { onMount } from 'svelte';
+	import { api, type InvestigationSummary } from '$lib/api/client';
+	import { authSession, isMsspScope } from '$lib/stores';
+	import { formatStatus, formatPhase, formatSeverity, formatDecision } from '$lib/utils/formatters';
 
-		// Show the per-row Tenant column only when the session is in
-		// cross-tenant view — i.e. an MSSP user with no current_tenant
-		// pin. Tenant-bound or assume-tenant'd sessions hide it because
-		// every row belongs to the same tenant.
-		$: showTenantColumn = $isMsspScope && !$authSession.user?.current_tenant;
+	// Show the per-row Tenant column only when the session is in
+	// cross-tenant view — i.e. an MSSP user with no current_tenant
+	// pin. Tenant-bound or assume-tenant'd sessions hide it because
+	// every row belongs to the same tenant.
+	$: showTenantColumn = $isMsspScope && !$authSession.user?.current_tenant;
 
-		let investigations: InvestigationSummary[] = [];
-		let loading = true;
-		let error: string | null = null;
-		let page = 1;
-		let total = 0;
+	const PAGE_SIZE = 20;
+
+	let investigations: InvestigationSummary[] = [];
+	let loading = true;
+	let error: string | null = null;
+	let page = 1;
+	let total = 0;
 	let hasMore = false;
 
 	// Filters
 	let statusFilter = '';
 	let phaseFilter = '';
+
+	// Reactive pagination calculations
+	$: totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+	$: canPrev = page > 1 && !loading;
+	$: canNext = (page < totalPages || hasMore) && !loading;
 
 	onMount(() => loadInvestigations());
 
@@ -29,17 +36,32 @@
 		try {
 			const result = await api.investigations.list({
 				page,
-				page_size: 20,
+				page_size: PAGE_SIZE,
 				status: statusFilter || undefined,
 				phase: phaseFilter || undefined
 			});
-			investigations = result.items;
-			total = result.total;
-			hasMore = result.has_more;
+			investigations = result.items || [];
+			total = result.total ?? (result.items?.length || 0);
+			// Calculate hasMore dynamically from total count if API response omits has_more
+			hasMore = result.has_more ?? (page * PAGE_SIZE < total);
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to load investigations';
 		} finally {
 			loading = false;
+		}
+	}
+
+	function goToNextPage() {
+		if (canNext) {
+			page++;
+			loadInvestigations();
+		}
+	}
+
+	function goToPrevPage() {
+		if (canPrev) {
+			page--;
+			loadInvestigations();
 		}
 	}
 
@@ -109,7 +131,7 @@
 	</select>
 </div>
 
-{#if loading}
+{#if loading && investigations.length === 0}
 	<div class="flex items-center justify-center h-64">
 		<div class="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-500"></div>
 	</div>
@@ -198,23 +220,23 @@
 	</div>
 
 	<!-- Pagination -->
-	{#if total > 20}
+	{#if total > PAGE_SIZE}
 		<div class="flex justify-between items-center mt-4">
 			<span class="text-sm opacity-60">
-				Showing {(page - 1) * 20 + 1} - {Math.min(page * 20, total)} of {total}
+				Showing {(page - 1) * PAGE_SIZE + 1} - {Math.min(page * PAGE_SIZE, total)} of {total} (Page {page} of {totalPages})
 			</span>
 			<div class="flex gap-2">
 				<button
 					class="btn btn-sm variant-soft"
-					disabled={page <= 1}
-					on:click={() => { page--; loadInvestigations(); }}
+					disabled={!canPrev}
+					on:click={goToPrevPage}
 				>
 					Previous
 				</button>
 				<button
 					class="btn btn-sm variant-soft"
-					disabled={!hasMore}
-					on:click={() => { page++; loadInvestigations(); }}
+					disabled={!canNext}
+					on:click={goToNextPage}
 				>
 					Next
 				</button>
