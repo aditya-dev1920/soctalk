@@ -501,7 +501,7 @@ async def _query_alerts(
         {"range": {"rule.level": {"gte": _min_severity()}}},
     ]
     must_not: list[dict] = []
-    if os.environ.get("SOCTALK_ADAPTER_EXCLUDE_MANAGER_AGENT", "1") in {"1", "true"}:
+    if os.environ.get("SOCTALK_ADAPTER_EXCLUDE_MANAGER_AGENT", "0") in {"1", "true"}:
         must_not.append({"term": {"agent.id": "000"}})
     prefix = os.environ.get("SOCTALK_ADAPTER_AGENT_PREFIX")
     if prefix:
