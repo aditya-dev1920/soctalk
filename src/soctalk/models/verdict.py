@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -15,6 +16,15 @@ from soctalk.models.enums import (
 )
 
 
+class SOPVerdict(str, Enum):
+    """Strict SOC Standard Operating Procedure (SOP) Verdict Classifications."""
+
+    TP_MALICIOUS = "True Positive – Malicious"
+    TP_BENIGN = "True Positive – Benign / Expected"
+    FP = "False Positive"
+    VALIDATION_REQUIRED = "Validation Required"
+
+
 class VerdictDraft(BaseModel):
     """LLM-facing verdict schema — bound as the structured output of the
     reasoning model. Excludes locally-stamped metadata (reasoning_model,
@@ -22,6 +32,13 @@ class VerdictDraft(BaseModel):
 
     decision: VerdictDecision = Field(
         ..., description="The verdict decision: escalate, close, or needs_more_info"
+    )
+    sop_verdict: Optional[SOPVerdict] = Field(
+        default=None,
+        description=(
+            "Standard SOC SOP verdict: 'True Positive – Malicious', "
+            "'True Positive – Benign / Expected', 'False Positive', or 'Validation Required'."
+        ),
     )
     confidence: float = Field(
         ..., ge=0.0, le=1.0, description="Confidence in the decision (0-1)"
@@ -94,9 +111,10 @@ class Verdict(VerdictDraft):
             VerdictDecision.NEEDS_MORE_INFO: "🔍",
         }
         emoji = decision_emoji.get(self.decision, "❓")
+        sop_str = f" | {self.sop_verdict.value}" if self.sop_verdict else ""
 
         lines = [
-            f"=== VERDICT: {emoji} {self.decision.value.upper()} ===",
+            f"=== VERDICT: {emoji} {self.decision.value.upper()}{sop_str} ===",
             f"Confidence: {self.confidence:.0%}",
             "",
             f"## Threat Assessment",
@@ -155,10 +173,11 @@ class Verdict(VerdictDraft):
             VerdictDecision.NEEDS_MORE_INFO: "🔍",
         }
         emoji = decision_emoji.get(self.decision, "❓")
+        sop_str = f" | {self.sop_verdict.value}" if self.sop_verdict else ""
 
         lines = [
             "=" * 60,
-            f"VERDICT: {emoji} {self.decision.value.upper()} (Confidence: {self.confidence:.0%})",
+            f"VERDICT: {emoji} {self.decision.value.upper()}{sop_str} (Confidence: {self.confidence:.0%})",
             "=" * 60,
             "",
             f"Impact: {self.potential_impact.value.upper()} | Urgency: {self.urgency.value.upper()}",

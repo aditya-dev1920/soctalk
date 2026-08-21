@@ -20,8 +20,11 @@
 	let expandedEvents: Set<string> = new Set();
 	let copiedLogId: string | null = null;
 
-	// Safe reactive extraction for Jira Key without in-template TypeScript casting
+	// Safe reactive extraction for Jira Key and SOP Verdict without in-template TypeScript casting
 	$: jiraIssueKey = (investigation as Record<string, any> | null)?.jira_issue_key;
+	$: sopVerdict = (investigation as Record<string, any> | null)?.sop_verdict 
+		|| (investigation as Record<string, any> | null)?.enrichments?.sop_verdict 
+		|| (investigation as Record<string, any> | null)?.verdict?.sop_verdict;
 
 	function toggleEventDetails(eventId: string) {
 		if (expandedEvents.has(eventId)) {
@@ -90,8 +93,10 @@
 			case 'phase.changed':
 				return `Phase changed: ${formatPhase(data.old_phase as string) || '?'} → ${formatPhase(data.new_phase as string || data.phase as string) || '?'}`;
 			case 'verdict.rendered':
-			case 'verdict.proposed':
-				return `Verdict: ${formatDecision(data.decision as string)} (${Math.round((data.confidence as number || 0) * 100)}% confidence)`;
+			case 'verdict.proposed': {
+				const sopBadge = data.sop_verdict ? ` [${data.sop_verdict}]` : '';
+				return `Verdict${sopBadge}: ${formatDecision(data.decision as string)} (${Math.round((data.confidence as number || 0) * 100)}% confidence)`;
+			}
 			case 'human.review_requested':
 			case 'review.requested':
 				return `Human review requested: ${data.reason || 'Manual review required'}`;
@@ -173,6 +178,7 @@
 			}
 			case 'verdict.rendered':
 			case 'verdict.proposed':
+				if (data.sop_verdict) details.push({ label: 'SOP Verdict', value: String(data.sop_verdict), highlight: true });
 				if (data.assessment) details.push({ label: 'Assessment', value: String(data.assessment) });
 				if (data.recommendation) details.push({ label: 'Recommendation', value: String(data.recommendation) });
 				if (data.evidence) {
@@ -288,6 +294,21 @@
 		}
 	}
 
+	function getSOPVerdictBadge(sopV: string | null | undefined): string {
+		switch (sopV) {
+			case 'True Positive – Malicious':
+				return 'variant-filled-error';
+			case 'True Positive – Benign / Expected':
+				return 'variant-filled-secondary';
+			case 'False Positive':
+				return 'variant-filled-success';
+			case 'Validation Required':
+				return 'variant-filled-warning';
+			default:
+				return 'variant-soft-primary';
+		}
+	}
+
 	function getEventIcon(eventType: string): string {
 		switch (eventType) {
 			case 'investigation.created':
@@ -376,7 +397,10 @@
 				{#if investigation.max_severity}
 					<span class="badge {getSeverityBadge(investigation.max_severity)}">{formatSeverity(investigation.max_severity)}</span>
 				{/if}
-				{#if investigation.verdict_decision}
+				{#if sopVerdict}
+					<span class="badge {getSOPVerdictBadge(sopVerdict)} font-semibold">{sopVerdict}</span>
+				{/if}
+				{#if investigation.verdict_decision && !sopVerdict}
 					<span class="badge {getVerdictBadge(investigation.verdict_decision)}">{formatDecision(investigation.verdict_decision)}</span>
 				{/if}
 				{#each investigation.tags as tag}
@@ -476,13 +500,21 @@
 				</dl>
 			</div>
 
-			{#if investigation.verdict_decision}
+			{#if investigation.verdict_decision || sopVerdict}
 				<div class="card p-4">
-					<h3 class="h4 mb-4">Verdict</h3>
+					<h3 class="h4 mb-4">Verdict & SOP Assessment</h3>
 					<div class="space-y-3">
+						{#if sopVerdict}
+							<div class="flex items-center justify-between">
+								<span class="opacity-60">SOP Classification</span>
+								<span class="badge {getSOPVerdictBadge(sopVerdict)} text-sm px-2.5 py-1 font-bold">
+									{sopVerdict}
+								</span>
+							</div>
+						{/if}
 						<div class="flex items-center justify-between">
-							<span class="opacity-60">Decision</span>
-							<span class="badge {getVerdictBadge(investigation.verdict_decision)} text-lg px-3 py-1">
+							<span class="opacity-60">Action Decision</span>
+							<span class="badge {getVerdictBadge(investigation.verdict_decision)} text-base px-3 py-1">
 								{formatDecision(investigation.verdict_decision)}
 							</span>
 						</div>
@@ -504,10 +536,10 @@
 						{/if}
 						{#if investigation.verdict_reasoning}
 							<div>
-								<span class="opacity-60 text-sm">Reasoning</span>
-								<p class="mt-1 text-sm bg-surface-500/20 rounded p-2">
+								<span class="opacity-60 text-sm">Reasoning & SOP Report</span>
+								<div class="mt-1 text-xs bg-surface-900 border border-surface-700 rounded p-3 max-h-96 overflow-y-auto whitespace-pre-wrap font-sans text-surface-200 selection:bg-primary-900">
 									{investigation.verdict_reasoning}
-								</p>
+								</div>
 							</div>
 						{/if}
 					</div>

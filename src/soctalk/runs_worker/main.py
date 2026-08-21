@@ -69,6 +69,7 @@ def _disposition_from_final(final: dict[str, Any], run_status: str) -> str:
 
     verdict = final.get("verdict") or {}
     decision = _enum_value(verdict.get("decision"))
+    sop_verdict = str(verdict.get("sop_verdict") or "").strip()
     sup = final.get("supervisor_decision") or {}
     sup_conf = float(sup.get("tp_confidence") or 0.0)
     sup_action = _enum_value(sup.get("next_action")).upper()
@@ -81,6 +82,12 @@ def _disposition_from_final(final: dict[str, Any], run_status: str) -> str:
     if final.get("verdict_interrupted"):
         return "escalate"
 
+    # SOP Verdict checks (Priority mapping)
+    if sop_verdict in {"True Positive – Malicious", "Validation Required"}:
+        return "escalate"
+    if sop_verdict == "False Positive":
+        return "close_fp"
+
     # Verdict node fired — trust its decision.
     if decision == "escalate":
         return "escalate"
@@ -88,11 +95,7 @@ def _disposition_from_final(final: dict[str, Any], run_status: str) -> str:
         return "close_fp"
     if decision == "needs_more_info":
         # ``needs_more_info`` is the AI explicitly asking for analyst
-        # review — escalate unconditionally. Previously this required
-        # supervisor confidence >= 0.7, but in practice a verdict that
-        # cannot auto-resolve always benefits from a human gate;
-        # leaving low-confidence cases as ``leave_open`` strands them
-        # in the queue with no resolution path.
+        # review — escalate unconditionally.
         return "escalate"
 
     # No verdict — supervisor short-circuited.
@@ -104,16 +107,19 @@ def _disposition_from_final(final: dict[str, Any], run_status: str) -> str:
 def _verdict_summary(final: dict[str, Any]) -> str | None:
     verdict = final.get("verdict") or {}
     rec = verdict.get("recommendation")
+    sop_v = verdict.get("sop_verdict")
+    prefix = f"[{sop_v}] " if sop_v else ""
+
     if rec and final.get("verdict_interrupted"):
         # An interrupted draft reaches the reviewer with its close-shaped
         # recommendation intact — say why it's in the queue (#45).
-        return (f"[SIGN-OFF REQUIRED: guard interrupted this draft] {rec}")[:1024]
+        return (f"[SIGN-OFF REQUIRED: guard interrupted this draft] {prefix}{rec}")[:1024]
     if rec:
-        return str(rec)[:1024]
+        return f"{prefix}{str(rec)}"[:1024]
     sup = final.get("supervisor_decision") or {}
     reasoning = sup.get("action_reasoning")
     if reasoning:
-        return str(reasoning)[:1024]
+        return f"{prefix}{str(reasoning)}"[:1024]
     return None
 
 
@@ -168,7 +174,7 @@ def _verdict_enrichments(final: dict[str, Any]) -> dict[str, Any]:
     """Pull observable + enrichment context for the review queue row.
 
     Includes Cortex / MISP outputs when present, plus a summary of
-    observables flagged by upstream workers.
+    observables flagged by upstream workers and the full SOP report.
     """
     out: dict[str, Any] = {}
     inv = final.get("investigation") or {}
@@ -185,6 +191,10 @@ def _verdict_enrichments(final: dict[str, Any]) -> dict[str, Any]:
             if isinstance(o, dict)
         ]
     verdict = final.get("verdict") or {}
+    if verdict.get("sop_verdict"):
+        out["sop_verdict"] = str(verdict["sop_verdict"])
+    if verdict.get("recommendation"):
+        out["sop_report"] = str(verdict["recommendation"])
     if verdict.get("threat_assessment"):
         out["threat_assessment"] = str(verdict["threat_assessment"])[:600]
     if verdict.get("evidence_strength"):
@@ -376,17 +386,6 @@ def _build_state(claim: dict[str, Any]) -> dict[str, Any]:
         # ignored for claimed runs.
         **_tokens_budget_kv(claim.get("tokens_budget")),
         "dollars_used": float(claim.get("dollars_used") or 0.0),
-        # Per-run dollar budget precedence (highest to lowest):
-        #   1. ``SOCTALK_CASE_RUN_DOLLAR_BUDGET`` env var, **if positive**
-        #      — operator override for the whole worker; useful for
-        #      tightening the cap below the DB policy default. A
-        #      non-positive value is treated as "ignore" rather than
-        #      "no budget" so an operator typo like ``=0`` or ``=-1``
-        #      doesn't halt every claimed run before any work is done.
-        #   2. Claim payload ``dollars_budget`` (if positive) — the DB
-        #      row, which typically reflects the per-investigation
-        #      policy.
-        #   3. Unset → ``token_budget.ensure`` falls back to $5.
         **_dollars_budget_kv(claim.get("dollars_budget")),
     }
 
@@ -594,11 +593,12 @@ async def _run_one(client: httpx.AsyncClient, claim: dict[str, Any]) -> None:
         verdict_summary = _verdict_summary(final)
     logger.info(
         "disposition_decided run=%s status=%s disposition=%s "
-        "verdict_decision=%r supervisor_action=%r supervisor_conf=%r",
+        "verdict_decision=%r sop_verdict=%r supervisor_action=%r supervisor_conf=%r",
         run_id,
         status,
         disposition,
         (final.get("verdict") or {}).get("decision"),
+        (final.get("verdict") or {}).get("sop_verdict"),
         (final.get("supervisor_decision") or {}).get("next_action"),
         (final.get("supervisor_decision") or {}).get("tp_confidence"),
     )

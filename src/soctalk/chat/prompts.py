@@ -119,6 +119,7 @@ def per_investigation_system_prompt(case: dict[str, Any]) -> str:
     status = inv.get("status", "?")
     severity = inv.get("severity", "?")
     ai_decision = pr.get("ai_decision") if pr else None
+    sop_verdict = pr.get("sop_verdict") or pr.get("ai_sop_verdict") if pr else None
     ai_confidence = pr.get("ai_confidence") if pr else None
     alert_count = len(alerts)
 
@@ -137,6 +138,7 @@ You are in *investigation* mode. Pre-loaded context for this case:
 - alerts attached: {alert_count}
 - pending HIL review: {'yes' if pr else 'no'}
 - AI verdict decision: {ai_decision or '—'}
+- AI SOP verdict: {sop_verdict or '—'}
 - AI confidence: {ai_confidence if ai_confidence is not None else '—'}
 
 This context is a *summary*. For full detail (descriptions,

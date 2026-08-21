@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -11,6 +12,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI
@@ -26,7 +28,7 @@ from soctalk_wire import (
 logger = logging.getLogger("soctalk.adapter")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # Startup durable-checkpoint load: retry with a freshly read token so a token
 # renewed just after pod start (see token_renewal) is picked up before we
@@ -189,9 +191,10 @@ _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _SHA256_RE = re.compile(r"\b[a-fA-F0-9]{64}\b")
 _MD5_RE = re.compile(r"\b[a-fA-F0-9]{32}\b")
 _DOMAIN_RE = re.compile(
-    r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|ru|cn|tk|xyz|info|biz)\b",
+    r"\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|ru|cn|tk|xyz|info|biz|online|site|tech|top)\b",
     re.IGNORECASE,
 )
+_URL_RE = re.compile(r"https?://[^\s\"'>]+", re.IGNORECASE)
 
 
 def _is_routable_ip(ip: str) -> bool:
@@ -212,40 +215,74 @@ def _is_routable_ip(ip: str) -> bool:
         return False
     return True
 
-## IOC Extraction for Network Artifacts (IPv4, SHA256, MD5, Domain) from Wazuh alert details in initial triage stage for agent, asset and identity context details
-def _extract_iocs(text: str) -> list[dict]:
-    if not text:
+
+## IOC Extraction for Network Artifacts (IPv4, SHA256, MD5, Domain, URL) from Wazuh alert details in initial triage stage
+def _extract_iocs(text: str, data: dict | None = None) -> list[dict]:
+    if not text and not data:
         return []
     seen: set[tuple[str, str]] = set()
     out: list[dict] = []
-    for ip in _IPV4_RE.findall(text):
-        if not _is_routable_ip(ip):
-            continue
-        key = ("ip", ip)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"type": "ip", "value": ip})
-    for h in _SHA256_RE.findall(text):
-        key = ("hash_sha256", h.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"type": "hash_sha256", "value": h.lower()})
-    for h in _MD5_RE.findall(text):
-        if any(k[1] == h.lower() for k in seen):
-            continue
-        key = ("hash_md5", h.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"type": "hash_md5", "value": h.lower()})
-    for d in _DOMAIN_RE.findall(text):
-        key = ("domain", d.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({"type": "domain", "value": d.lower()})
+
+    def _add(t: str, v: Any) -> None:
+        if not v:
+            return
+        s = str(v).strip()
+        if not s or s.lower() in ("unknown", "null", "none", "0.0.0.0", "127.0.0.1"):
+            return
+        key = (t, s.lower() if "hash" in t or t == "domain" else s)
+        if key not in seen:
+            seen.add(key)
+            out.append({"type": t, "value": s if t == "url" else key[1]})
+
+    # 1. Text Regex Scanning
+    if text:
+        for ip in _IPV4_RE.findall(text):
+            if _is_routable_ip(ip):
+                _add("ip", ip)
+        for h in _SHA256_RE.findall(text):
+            _add("hash_sha256", h)
+        for h in _MD5_RE.findall(text):
+            if not any(k[0] == "hash_sha256" and h.lower() in k[1] for k in seen):
+                _add("hash_md5", h)
+        for d in _DOMAIN_RE.findall(text):
+            _add("domain", d)
+        for u in _URL_RE.findall(text):
+            _add("url", u)
+
+    # 2. Direct Structured Decoder Fields Extraction
+    if isinstance(data, dict):
+        for ip_val in (
+            data.get("srcip"),
+            data.get("dstip"),
+            (data.get("win") or {}).get("eventdata", {}).get("destinationIp"),
+            (data.get("win") or {}).get("eventdata", {}).get("sourceIp"),
+        ):
+            if ip_val and _is_routable_ip(str(ip_val)):
+                _add("ip", str(ip_val))
+
+        if data.get("url"):
+            _add("url", str(data["url"]))
+            try:
+                parsed = urlparse(str(data["url"]))
+                if parsed.netloc:
+                    _add("domain", parsed.netloc.split(":")[0])
+            except Exception:
+                pass
+
+        if data.get("domain"):
+            _add("domain", str(data["domain"]))
+
+        win_ev = (data.get("win") or {}).get("eventdata") or {}
+        if win_ev.get("queryName"):
+            _add("domain", str(win_ev["queryName"]))
+
+        if win_ev.get("hashes"):
+            for part in str(win_ev["hashes"]).split(","):
+                if "=" in part:
+                    _add("hash_sha256" if "sha256" in part.lower() else "hash_md5", part.split("=", 1)[1])
+                else:
+                    _add("hash_sha256" if len(part) == 64 else "hash_md5", part)
+
     return out[:32]
 
 
@@ -254,7 +291,8 @@ _FIM_FILE_RE = re.compile(r"File '([^']+)' (?:was )?(?:modified|added|deleted|ch
 _USERID_KV_RE = re.compile(r"\b(?:USER|user|uid)=([A-Za-z0-9_\-.]+)")
 _IP_RE = re.compile(r"\b(?:from|src ip|source)\s*[=:]?\s*((?:\d{1,3}\.){3}\d{1,3})", re.I)
 
-## Artifact for file & FIM artifacts in intial triage stage for agent
+
+## Artifact for file & FIM artifacts in initial triage stage for agent
 def _extract_subject(full_log: str) -> str | None:
     """Best-effort extraction of the alert's primary subject from
     Wazuh's ``full_log`` line. Handles common useradd / groupadd / FIM
@@ -282,11 +320,11 @@ def _compose_title(rule_desc: str, agent_name: str | None, subject: str | None) 
     if subject:
         base = f"{base}: {subject}"
     if agent_name:
-        base = f"{base} on {agent_name}" ## agent name captured in agent, asset and identity context for title composition in initial triage
+        base = f"{base} on {agent_name}"  ## agent name captured in agent, asset and identity context for title composition in initial triage
     return base[:255]
 
 
-# To check involved accounts (Actor/Target) 
+# To check involved accounts (Actor/Target) and harvest artifacts
 def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[dict]:
     """Typed, role-carrying entities from fields the Wazuh decoder already
     parsed (issue #17 fix 1). ``source_field`` preserves provenance.
@@ -301,14 +339,16 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
         if v is None:
             return
         s = str(v).strip()
-        if s:
+        if s and s.lower() not in ("unknown", "null", "none"):
             ents.append({"type": t, "value": s[:512], "role": role, "source_field": field})
 
     if isinstance(agent, dict) and agent.get("id"):
         add("host", agent.get("name") or agent.get("id"), "target", "agent.name")
+        if agent.get("ip"):
+            add("ip", agent.get("ip"), "target", "agent.ip")
+
     data = src.get("data") or {}
     if isinstance(data, dict):
-        
         ### Data being fetched by initial triage phase for capturing agent, asset and identity context
         add("user", data.get("srcuser"), "actor", "data.srcuser")
         add("user", data.get("dstuser"), "target", "data.dstuser")
@@ -319,7 +359,27 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
         add("port", data.get("dstport"), "dst", "data.dstport")
         add("process", data.get("process") or data.get("command"), "actor", "data.process")
 
-        # Windows EventData extraction
+        # Linux Auditd user identities
+        audit = data.get("audit") or {}
+        if isinstance(audit, dict):
+            add("user", audit.get("uid"), "actor", "data.audit.uid")
+            add("user", audit.get("euid"), "actor", "data.audit.euid")
+            add("user", audit.get("auid"), "actor", "data.audit.auid")
+            add("process", audit.get("exe") or audit.get("command"), "actor", "data.audit.exe")
+
+        # Network / Web artifacts (URLs & Domains)
+        if data.get("url"):
+            add("url", data.get("url"), "observable", "data.url")
+            try:
+                parsed = urlparse(str(data["url"]))
+                if parsed.netloc:
+                    add("domain", parsed.netloc.split(":")[0], "observable", "data.url")
+            except Exception:
+                pass
+        if data.get("domain"):
+            add("domain", data.get("domain"), "observable", "data.domain")
+
+        # Windows EventData extraction (Sysmon & Security Logs)
         win = data.get("win") or {}
         if isinstance(win, dict):
             ev_data = win.get("eventdata") or {}
@@ -328,6 +388,9 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
                 add("process", ev_data.get("image") or ev_data.get("parentImage"), "actor", "win.eventdata.image")
                 add("ip", ev_data.get("sourceIp"), "src", "win.eventdata.sourceIp")
                 add("ip", ev_data.get("destinationIp"), "dst", "win.eventdata.destinationIp")
+                if ev_data.get("queryName"):
+                    add("domain", ev_data.get("queryName"), "target", "win.eventdata.queryName")
+
 
         # Vulnerability Detector extraction
         vuln = data.get("vulnerability")
@@ -339,6 +402,16 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
             if pkg:
                 add("package", pkg, "target", "data.vulnerability.package.name")
 
+    # FIM / Syscheck artifacts
+    syscheck = src.get("syscheck") or {}
+    if isinstance(syscheck, dict):
+        if syscheck.get("path"):
+            add("file", syscheck.get("path"), "target", "syscheck.path")
+        if syscheck.get("sha256_after"):
+            add("hash", syscheck.get("sha256_after"), "observable", "syscheck.sha256_after")
+        if syscheck.get("md5_after"):
+            add("hash", syscheck.get("md5_after"), "observable", "syscheck.md5_after")
+
     seen: set[tuple] = set()
     out: list[dict] = []
     for e in ents:
@@ -349,8 +422,8 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
     return out[:64]
 
 
-def _extract_mitre(rule: dict) -> dict:
-    mitre = rule.get("mitre") or {}
+def _extract_mitre(rule: dict, data: dict | None = None) -> dict:
+    mitre = rule.get("mitre") or (data.get("mitre") if isinstance(data, dict) else {}) or {}
     groups = [str(g).lower() for g in (rule.get("groups") or [])]
 
     ids: list[str] = []
@@ -360,13 +433,13 @@ def _extract_mitre(rule: dict) -> dict:
     if isinstance(mitre, dict) and any(mitre.values()):
         def _cap(v: Any) -> list[str]:
             if isinstance(v, list):
-                return [str(x)[:32] for x in v][:16]
+                return [str(x)[:32] for x in v if x][:16]
             if v:
                 return [str(v)[:32]]
             return []
-        ids = _cap(mitre.get("id"))
-        tactics = _cap(mitre.get("tactic"))
-        techniques = _cap(mitre.get("technique"))
+        ids = _cap(mitre.get("id") or mitre.get("ids"))
+        tactics = _cap(mitre.get("tactic") or mitre.get("tactics"))
+        techniques = _cap(mitre.get("technique") or mitre.get("techniques"))
 
     # Dynamic fallback heuristics for unmapped rules
     if not ids:
@@ -405,6 +478,10 @@ def _extract_full_log(src: dict, rule: dict) -> str:
             return str(data["full_log"])
         if data.get("raw"):
             return str(data["raw"])
+        if data.get("message"):
+            return str(data["message"])
+        if data.get("log"):
+            return str(data["log"])
         win_cmd = (data.get("win") or {}).get("eventdata", {}).get("commandLine")
         if win_cmd:
             return str(win_cmd)
@@ -421,8 +498,14 @@ def _extract_full_log(src: dict, rule: dict) -> str:
             title = vuln.get("title") or ""
             return f"{cve} affecting {pkg} {ver} - {title}".strip(" -")
 
-    # 3. Fallback to rule description
-    return str(rule.get("description") or "")
+    # 3. Fallback to rule description + serialized telemetry if available
+    desc = str(rule.get("description") or "")
+    if isinstance(data, dict) and data:
+        try:
+            return f"{desc} | Telemetry: {json.dumps(data, default=str)}"
+        except Exception:
+            pass
+    return desc
 
 
 _ALLOWED_ENTITY_TYPES = {"user", "host", "ip", "process", "hash", "domain", "port"}
@@ -483,17 +566,27 @@ def _hit_to_event(hit: dict) -> dict | None:
         return None
     rule = src.get("rule") or {}
     agent = src.get("agent") or {}
+    data = src.get("data") or {}
     rule_desc = rule.get("description") or ""
     agent_name = agent.get("name") if isinstance(agent, dict) else None
+    agent_id = str(agent.get("id") or "") if isinstance(agent, dict) else ""
     asset_ids: list[str] = []
-    if isinstance(agent, dict) and agent.get("id"):
-        asset_ids.append(agent["id"][:64])
+    if agent_id:
+        asset_ids.append(agent_id[:64])
     if agent_name:
         asset_ids.append(agent_name[:64])
 
     full_log = _extract_full_log(src, rule)
-    iocs = _extract_iocs(f"{rule_desc} {full_log}")
+    iocs = _extract_iocs(f"{rule_desc} {full_log}", data if isinstance(data, dict) else None)
     entities = _extract_entities(src, agent, agent_name)
+
+    # Perimeter appliance name resolution (e.g. FortiGate via Agent 000 syslog)
+    if agent_id == "000":
+        dev_m = re.search(r'\b(?:devname|hostname|host|dvc)=["\']?([A-Za-z0-9_\-.]{3,64})["\']?', full_log)
+        if dev_m:
+            resolved_dev = dev_m.group(1)[:64]
+            if resolved_dev not in asset_ids:
+                asset_ids.append(resolved_dev)
 
     full_log_red = redact_text(full_log)[:4096] if full_log else ""
     rule_desc_red = redact_text(rule_desc)[:512] if rule_desc else ""
@@ -516,7 +609,7 @@ def _hit_to_event(hit: dict) -> dict | None:
         "description": description,
         "title": title,
         "entities": entities,
-        "mitre": _extract_mitre(rule),
+        "mitre": _extract_mitre(rule, data if isinstance(data, dict) else None),
         "rule_groups": [str(g)[:64] for g in (rule.get("groups") or [])][:16],
         "decoder": (src.get("decoder") or {}).get("name"),
         "full_log": full_log_red,
@@ -527,9 +620,11 @@ def _hit_to_event(hit: dict) -> dict | None:
             "rule_description": rule_desc_red,
             "rule_groups": rule.get("groups") or [],
             "decoder_name": (src.get("decoder") or {}).get("name"),
+            "decoder_parent": (src.get("decoder") or {}).get("parent"),
             "location": src.get("location"),
             "manager_name": (src.get("manager") or {}).get("name"),
             "full_log": full_log_red,
+            "raw_source": src,  # Preserves complete unflattened telemetry for deep graph investigation
         },
     }
 

@@ -28,6 +28,7 @@ VETO_ACTIVE_INCIDENT = "active_incident"
 VETO_AUTHZ_CONTRADICTED = "authorization_contradicted"
 VETO_KILL_SWITCH = "auto_close_killed"
 VETO_VOLUME_CAP = "close_volume_cap"
+VETO_SOP_VERDICT = "sop_verdict_veto"
 
 # Audit actions on the API/IR planes (queried like other ir.* rows).
 FLOOR_AUDIT_ACTION = "ir.triage_policy.close_floor_veto"
@@ -51,30 +52,23 @@ def auto_close_killed(policy: dict[str, Any] | None = None) -> bool:
 def worker_close_vetoes(final_state: dict[str, Any]) -> list[str]:
     """Floor reasons that forbid a ``close_fp`` disposition for this graph run.
 
-    Pure over the graph's terminal state. Three vetoes:
-
-    - IOC: a malicious enrichment verdict or a MISP IOC match — the exact signal the
-      verdict prompt warns about (shared helper so prompt and floor can't disagree).
-      Deliberately NOT raw un-enriched ``initial_iocs`` on a verdict-tier close: the
-      reasoning model saw them listed in its prompt and judged them, and vetoing
-      every close that carries an extracted indicator would escalate the entire
-      benign-FP stream (the over-ruling-into-SOAR failure the issue warns against).
-      Raw IOCs veto on the ingest plane, where closes happen with NO look.
-    - unverified IOC: a close with NO verdict (the supervisor's router-tier CLOSE
-      short-circuit) while IOC observables were never enriched. The router alone —
-      cheapest model, no reasoning pass, no TI — must not be able to close over
-      indicators nothing ever looked at.
-    - contradicted authorization: the deterministic engine says records are present
-      but do not cover. This backstops the in-graph verdict_guard for terminal
-      states that never pass a verdict.
-    - ``correlation.active_incident``: honored when a future claim payload carries
-      it; today's claims don't, so the active-incident floor is enforced server-side
-      in ``complete_run()`` and on the IR ingest plane.
+    Pure over the graph's terminal state. Vetoes include:
+    - IOC: a malicious enrichment verdict or a MISP IOC match.
+    - unverified IOC: a close with NO verdict while IOC observables were never enriched.
+    - contradicted authorization: records present but fail to cover.
+    - SOP Verdict: explicit SOP classification as True Positive – Malicious or Validation Required.
     """
     vetoes: list[str] = []
     investigation = final_state.get("investigation") or {}
     if has_malicious_signal(investigation):
         vetoes.append(VETO_IOC)
+    
+    # SOP Verdict Safety Check: Never allow closing on Malicious or Validation Required
+    verdict = final_state.get("verdict") or {}
+    sop_verdict = str(verdict.get("sop_verdict") or "")
+    if sop_verdict in {"True Positive – Malicious", "Validation Required"}:
+        vetoes.append(VETO_SOP_VERDICT)
+
     if not final_state.get("verdict") and _has_unenriched_observables(investigation):
         vetoes.append(VETO_UNVERIFIED_IOC)
     authz_class, _ = derive_authz_class(parse_authorization_context(investigation))
@@ -87,9 +81,7 @@ def worker_close_vetoes(final_state: dict[str, Any]) -> list[str]:
 
 
 def _has_unenriched_observables(investigation: dict[str, Any]) -> bool:
-    """Any IOC observable on the investigation that no enrichment ever covered.
-    Observables originate from the alert's ``initial_iocs`` (and worker extraction),
-    so an uncovered one is an indicator that was never checked against TI."""
+    """Any IOC observable on the investigation that no enrichment ever covered."""
     observables = investigation.get("observables") or []
     if not observables:
         return False

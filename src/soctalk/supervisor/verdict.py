@@ -69,16 +69,43 @@ Distinguish ABSENT evidence from CONTRADICTED evidence — they call for differe
 Authorization evidence lowers suspicion; it NEVER overrides malicious indicators, IOC matches,
 or active-incident correlation.
 
-## Decision Options
+## Decision Options & SOP Verdict Mapping
 
-- **ESCALATE**: Evidence supports real threat, send to human for incident creation
-- **CLOSE**: Evidence strongly suggests false positive, close investigation
-- **NEEDS_MORE_INFO**: Cannot make decision, need specific additional investigation
+Select both the internal routing `decision` and the formal `sop_verdict`:
+
+1. **True Positive – Malicious** (`decision: "escalate"`):
+   - Confirmed malicious activity or unmitigated high-risk exploit/C2 attempt.
+2. **True Positive – Benign / Expected** (`decision: "escalate"` or `"close"`):
+   - Legitimate administrative script, authorized security test, or approved change.
+3. **False Positive** (`decision: "close"`):
+   - Rule misfire, benign system noise, or known non-malicious signature trigger.
+4. **Validation Required** (`decision: "needs_more_info"` or `"escalate"`):
+   - Ambiguous activity needing asset owner or user verification.
+
+## Report Formatting Requirements (in `recommendation` field)
+
+Structure your `recommendation` string using this exact 3-part Markdown format:
+
+### PART 1: ALERT DETAILS
+- Primary Rule ID, Description, and Severity Level
+- Affected Asset / Endpoint (or Perimeter Device if Agent 000)
+- Key Network & User Observables (Source/Dest IP, Ports, Account)
+
+### PART 2: ANALYSIS & IMPACT
+- Root Cause & Forensic Findings (Payload Analysis, Process Lineage, Threat Intel)
+- Perimeter & Host Disposition (e.g. Connection dropped by firewall, active execution)
+- Blast Radius & Impact Assessment
+
+### PART 3: RECOMMENDATIONS & REMEDIATION PLAN
+- Immediate Containment Steps (with executable firewall / host isolation commands)
+- Eradication & Verification Steps
+- Indicator Blocking & Tuning Recommendations
 
 ## Response Format
 
 Provide your verdict with these fields:
 - decision: "escalate" | "close" | "needs_more_info"
+- sop_verdict: "True Positive – Malicious" | "True Positive – Benign / Expected" | "False Positive" | "Validation Required"
 - confidence: 0.0-1.0
 - threat_assessment: Overall assessment of the threat
 - evidence_strength: "weak" | "moderate" | "strong" | "conclusive"
@@ -88,7 +115,7 @@ Provide your verdict with these fields:
 - gaps_in_evidence: What's missing
 - assumptions_made: Assumptions in your analysis
 - alternative_explanations: Benign explanations considered
-- recommendation: Final recommendation with reasoning
+- recommendation: Complete 3-Part Markdown formatted report and action plan
 - additional_investigation_needed: (if needs_more_info) What specific investigation is needed
 """
 
@@ -167,6 +194,7 @@ async def verdict_node(
         logger.info(
             "verdict_rendered",
             decision=verdict.decision.value,
+            sop_verdict=verdict.sop_verdict.value if verdict.sop_verdict else None,
             confidence=verdict.confidence,
             impact=verdict.potential_impact.value,
         )
