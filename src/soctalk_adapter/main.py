@@ -425,6 +425,57 @@ def _extract_full_log(src: dict, rule: dict) -> str:
     return str(rule.get("description") or "")
 
 
+_ALLOWED_ENTITY_TYPES = {"user", "host", "ip", "process", "hash", "domain", "port"}
+
+
+def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[dict]:
+    """Typed, role-carrying entities conforming strictly to the Wire Schema enum.
+
+    Allowed types: 'user', 'host', 'ip', 'process', 'hash', 'domain', 'port'.
+    """
+    ents: list[dict] = []
+
+    def add(t: str, v: Any, role: str | None, field: str) -> None:
+        if v is None or t not in _ALLOWED_ENTITY_TYPES:
+            return
+        s = str(v).strip()
+        if s:
+            ents.append({"type": t, "value": s[:512], "role": role, "source_field": field})
+
+    if isinstance(agent, dict) and agent.get("id"):
+        add("host", agent.get("name") or agent.get("id"), "target", "agent.name")
+
+    data = src.get("data") or {}
+    if isinstance(data, dict):
+        add("user", data.get("srcuser"), "actor", "data.srcuser")
+        add("user", data.get("dstuser"), "target", "data.dstuser")
+        add("user", data.get("user"), "actor", "data.user")
+        add("ip", data.get("srcip"), "src", "data.srcip")
+        add("ip", data.get("dstip"), "dst", "data.dstip")
+        add("port", data.get("srcport"), "src", "data.srcport")
+        add("port", data.get("dstport"), "dst", "data.dstport")
+        add("process", data.get("process") or data.get("command"), "actor", "data.process")
+
+        # Windows EventData extraction
+        win = data.get("win") or {}
+        if isinstance(win, dict):
+            ev_data = win.get("eventdata") or {}
+            if isinstance(ev_data, dict):
+                add("user", ev_data.get("targetUserName") or ev_data.get("subjectUserName"), "target", "win.eventdata.user")
+                add("process", ev_data.get("image") or ev_data.get("parentImage"), "actor", "win.eventdata.image")
+                add("ip", ev_data.get("sourceIp"), "src", "win.eventdata.sourceIp")
+                add("ip", ev_data.get("destinationIp"), "dst", "win.eventdata.destinationIp")
+
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for e in ents:
+        k = (e["type"], e["value"], e["role"])
+        if k not in seen:
+            seen.add(k)
+            out.append(e)
+    return out[:64]
+
+
 def _hit_to_event(hit: dict) -> dict | None:
     src = hit.get("_source") or {}
     source_id = src.get("id") or hit.get("_id")
@@ -614,7 +665,7 @@ async def _ingest_loop() -> None:
     if os.environ.get("SOCTALK_INGEST_DISABLED", "0") in {"1", "true"}:
         logger.info("ingest_disabled")
         return
-    interval = float(os.environ.get("SOCTALK_INGEST_INTERVAL_SECONDS", "30"))
+    interval = float(os.environ.get("SOCTALK_INGEST_INTERVAL_SECONDS", "60"))
     batch_size = int(os.environ.get("SOCTALK_INGEST_BATCH_SIZE", "100"))
     api_url = os.environ["SOCTALK_API_URL"].rstrip("/")
     tenant_id = os.environ["SOCTALK_TENANT_ID"]
@@ -703,6 +754,17 @@ async def _ingest_loop() -> None:
                             _state.alerts_forwarded, _state.alerts_duplicate,
                             _state.alerts_forwarded, new_cursor_ts, new_cursor_id,
                         )
+            except httpx.HTTPStatusError as e:
+                # Capture exact FastAPI/Pydantic validation details on 422
+                error_detail = e.response.text
+                _state.last_ingest_error = f"{e} | Response: {error_detail}"
+                logger.error(
+                    "ingest_http_error status=%d url=%s response=%s sample_event=%s",
+                    e.response.status_code,
+                    e.request.url,
+                    error_detail,
+                    events[0] if "events" in locals() and events else "None",
+                )
             except Exception as e:
                 _state.last_ingest_error = str(e)
                 logger.warning("ingest_failed: %s", e)
