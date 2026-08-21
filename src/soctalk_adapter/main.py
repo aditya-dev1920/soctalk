@@ -28,12 +28,8 @@ from soctalk_wire import (
 logger = logging.getLogger("soctalk.adapter")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
-# Startup durable-checkpoint load: retry with a freshly read token so a token
-# renewed just after pod start (see token_renewal) is picked up before we
-# ingest from a stale local cursor. ~60s total covers Secret projection; a
-# no-checkpoint tenant returns 200 (empty) and loads on the first try.
 CHECKPOINT_LOAD_MAX_ATTEMPTS = 10
 CHECKPOINT_LOAD_RETRY_SECONDS = 6.0
 
@@ -44,13 +40,6 @@ def _read_token() -> str:
 
 
 def _initial_alert_ts() -> str:
-    """Initial cursor for alert ingestion.
-
-    Defaults to epoch (full backfill). Set SOCTALK_INGEST_INITIAL_TS to
-    an ISO-8601 timestamp to start ingesting from a specific point, or
-    to the literal string ``"now"`` to skip backfill entirely (start
-    from the moment the adapter boots).
-    """
     raw = os.environ.get("SOCTALK_INGEST_INITIAL_TS", "").strip()
     if not raw:
         return "1970-01-01T00:00:00.000Z"
@@ -64,8 +53,6 @@ class _State:
         self.last_heartbeat_ok: datetime | None = None
         self.last_heartbeat_error: str | None = None
         self.last_alert_ts: str = _initial_alert_ts()
-        # search_after tie-breaker: the ``id`` of the last event ingested at
-        # last_alert_ts. None means "start of this timestamp".
         self.last_alert_id: str | None = None
         self.alerts_queried: int = 0
         self.alerts_forwarded: int = 0
@@ -80,15 +67,6 @@ _state = _State()
 
 
 class _TokenBucket:
-    """Cooperative rate-limiter for per-tenant alert ingestion.
-
-    The adapter is single-tenant (one process per tenant), so a process-
-    local token bucket is the per-tenant cap by construction. ``rate``
-    is alerts/sec, ``burst`` is the bucket size. Excess alerts are
-    dropped (and counted on ``_state.alerts_dropped_rate_limit``) rather
-    than queued — better to lose a tail of a flood than to lag forever.
-    """
-
     def __init__(self, rate_per_sec: float, burst: int) -> None:
         self.rate = max(rate_per_sec, 0.0)
         self.burst = max(burst, 1)
@@ -96,9 +74,8 @@ class _TokenBucket:
         self.last = time.monotonic()
 
     def take(self, n: int) -> tuple[int, int]:
-        """Take up to ``n`` tokens. Returns (allowed, dropped)."""
         if self.rate <= 0:
-            return n, 0  # rate-limiter disabled
+            return n, 0
         now = time.monotonic()
         self.tokens = min(self.burst, self.tokens + (now - self.last) * self.rate)
         self.last = now
@@ -117,9 +94,7 @@ _rate_limiter = _make_rate_limiter()
 
 
 def _wazuh_indexer_url() -> str:
-    return os.environ.get(
-        "WAZUH_INDEXER_URL", "https://wazuh-indexer:9200"
-    ).rstrip("/")
+    return os.environ.get("WAZUH_INDEXER_URL", "https://wazuh-indexer:9200").rstrip("/")
 
 
 def _wazuh_indexer_creds() -> tuple[str, str]:
@@ -130,17 +105,6 @@ def _wazuh_indexer_creds() -> tuple[str, str]:
 
 
 def _wazuh_indexer_verify_ssl() -> bool:
-    """Resolve TLS verification for the Wazuh indexer httpx client.
-
-    Reads ``WAZUH_INDEXER_VERIFY_SSL`` (default ``"true"``). Recognises the
-    canonical spellings ``true``/``1`` (verify ON) and ``false``/``0`` (verify
-    OFF), case-insensitive and whitespace-trimmed. Any other value is
-    malformed: log a warning and fail safe to verification ON — a typo must
-    never silently disable TLS verification against the indexer. The chart
-    feeds this from ``IntegrationConfig.wazuh_verify_ssl`` so a tenant whose
-    external (or in-cluster self-signed) indexer needs ``verify=False`` can
-    opt out explicitly.
-    """
     raw = os.environ.get("WAZUH_INDEXER_VERIFY_SSL", "true")
     normalized = raw.strip().lower()
     if normalized in {"true", "1"}:
@@ -148,25 +112,12 @@ def _wazuh_indexer_verify_ssl() -> bool:
     if normalized in {"false", "0"}:
         return False
     logger.warning(
-        "WAZUH_INDEXER_VERIFY_SSL=%r is not a recognised boolean; "
-        "defaulting to verify=True",
-        raw,
+        "WAZUH_INDEXER_VERIFY_SSL=%r is not a recognised boolean; defaulting to verify=True", raw
     )
     return True
 
 
 def _soctalk_api_verify_ssl() -> bool:
-    """Resolve TLS verification for the Soctalk API httpx client.
-
-    Reads ``SOCTALK_API_VERIFY_SSL`` (default ``"true"``). Recognises the
-    canonical spellings ``true``/``1`` (verify ON) and ``false``/``0`` (verify
-    OFF), case-insensitive and whitespace-trimmed. Any other value is
-    malformed: log a warning and fail safe to verification ON — a typo must
-    never silently disable TLS verification against the API. The chart
-    feeds this from ``IntegrationConfig.soctalk_verify_ssl`` so a tenant whose
-    external (or in-cluster self-signed) API needs ``verify=False`` can
-    opt out explicitly.
-    """
     raw = os.environ.get("SOCTALK_API_VERIFY_SSL", "true")
     normalized = raw.strip().lower()
     if normalized in {"true", "1"}:
@@ -174,9 +125,7 @@ def _soctalk_api_verify_ssl() -> bool:
     if normalized in {"false", "0"}:
         return False
     logger.warning(
-        "SOCTALK_API_VERIFY_SSL=%r is not a recognised boolean; "
-        "defaulting to verify=True",
-        raw,
+        "SOCTALK_API_VERIFY_SSL=%r is not a recognised boolean; defaulting to verify=True", raw
     )
     return True
 
@@ -195,6 +144,7 @@ _DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 _URL_RE = re.compile(r"https?://[^\s\"'>]+", re.IGNORECASE)
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _EMBEDDED_DOMAIN_RE = re.compile(
     r'(?:ldap://|https?://|error=[\$%7B]*jndi:ldap://[^\s/]+/)?([a-zA-Z0-9.-]+\.(?:com|net|org|io|ru|cn|tk|xyz|info|biz|online|site|tech|top))\b',
     re.IGNORECASE,
@@ -220,7 +170,6 @@ def _is_routable_ip(ip: str) -> bool:
     return True
 
 
-## IOC Extraction for Network Artifacts (IPv4, SHA256, MD5, Domain, URL) from Wazuh alert details in initial triage stage
 def _extract_iocs(text: str, data: dict | None = None) -> list[dict]:
     if not text and not data:
         return []
@@ -233,7 +182,7 @@ def _extract_iocs(text: str, data: dict | None = None) -> list[dict]:
         s = str(v).strip().strip("'\"")
         if not s or s.lower() in ("unknown", "null", "none", "0.0.0.0", "127.0.0.1", "localhost"):
             return
-        key = (t, s.lower() if "hash" in t or t == "domain" else s)
+        key = (t, s.lower() if "hash" in t or t in ("domain", "email") else s)
         if key not in seen:
             seen.add(key)
             out.append({"type": t, "value": s if t == "url" else key[1]})
@@ -253,41 +202,55 @@ def _extract_iocs(text: str, data: dict | None = None) -> list[dict]:
                 _add("domain", d)
         for u in _URL_RE.findall(text):
             _add("url", u)
+        for em in _EMAIL_RE.findall(text):
+            _add("email", em)
         for dom in _EMBEDDED_DOMAIN_RE.findall(text):
             if not any(dom.lower().endswith(sfx) for sfx in (".local", ".lan")):
                 _add("domain", dom)
 
-    # 2. Direct Structured Decoder Fields Extraction
+    # 2. Dynamic Structured Decoder Fields Extraction
     if isinstance(data, dict):
-        for ip_val in (
-            data.get("srcip"),
-            data.get("dstip"),
-            (data.get("win") or {}).get("eventdata", {}).get("destinationIp"),
-            (data.get("win") or {}).get("eventdata", {}).get("sourceIp"),
+        # Network IPs
+        for ip_field in (
+            "srcip", "dstip", "SourceIP", "ClientIP", "source_ip", "destination_ip", "caller_ip_address"
         ):
+            ip_val = data.get(ip_field)
             if ip_val and _is_routable_ip(str(ip_val)):
                 _add("ip", str(ip_val))
 
-        if data.get("url"):
-            url_str = str(data["url"])
-            _add("url", url_str)
-            try:
-                parsed = urlparse(url_str)
-                if parsed.netloc:
-                    _add("domain", parsed.netloc.split(":")[0])
-            except Exception:
-                pass
-            for dom in _EMBEDDED_DOMAIN_RE.findall(url_str):
-                if not any(dom.lower().endswith(sfx) for sfx in (".local", ".lan")):
-                    _add("domain", dom)
+        win_ev = (data.get("win") or {}).get("eventdata") or {}
+        for ip_val in (win_ev.get("destinationIp"), win_ev.get("sourceIp")):
+            if ip_val and _is_routable_ip(str(ip_val)):
+                _add("ip", str(ip_val))
+
+        # Email Artifacts (Office 365, Exchange, Defender)
+        for em_field in ("Sender", "Recipient", "UserId", "User", "sender", "recipient", "from", "to"):
+            em_val = data.get(em_field)
+            if em_val and "@" in str(em_val):
+                for em in _EMAIL_RE.findall(str(em_val)):
+                    _add("email", em)
+
+        # URLs and Domains
+        for url_field in ("url", "URL", "Url", "target_url", "request_url"):
+            if data.get(url_field):
+                url_str = str(data[url_field])
+                _add("url", url_str)
+                try:
+                    parsed = urlparse(url_str)
+                    if parsed.netloc:
+                        _add("domain", parsed.netloc.split(":")[0])
+                except Exception:
+                    pass
+                for dom in _EMBEDDED_DOMAIN_RE.findall(url_str):
+                    if not any(dom.lower().endswith(sfx) for sfx in (".local", ".lan")):
+                        _add("domain", dom)
 
         if data.get("domain"):
             _add("domain", str(data["domain"]))
-
-        win_ev = (data.get("win") or {}).get("eventdata") or {}
         if win_ev.get("queryName"):
             _add("domain", str(win_ev["queryName"]))
 
+        # Hashes
         if win_ev.get("hashes"):
             for part in str(win_ev["hashes"]).split(","):
                 if "=" in part:
@@ -304,13 +267,7 @@ _USERID_KV_RE = re.compile(r"\b(?:USER|user|uid)=([A-Za-z0-9_\-.]+)")
 _IP_RE = re.compile(r"\b(?:from|src ip|source)\s*[=:]?\s*((?:\d{1,3}\.){3}\d{1,3})", re.I)
 
 
-## Artifact for file & FIM artifacts in initial triage stage for agent
 def _extract_subject(full_log: str) -> str | None:
-    """Best-effort extraction of the alert's primary subject from
-    Wazuh's ``full_log`` line. Handles common useradd / groupadd / FIM
-    / authentication patterns. Returns ``None`` if no obvious subject
-    found — the title falls back to rule description only.
-    """
     if not full_log:
         return None
     for rx in (_FIM_FILE_RE, _NAME_KV_RE, _USERID_KV_RE, _IP_RE):
@@ -321,33 +278,18 @@ def _extract_subject(full_log: str) -> str | None:
 
 
 def _compose_title(rule_desc: str, agent_name: str | None, subject: str | None) -> str:
-    """Compose an analyst-friendly title: ``{rule_desc}[: subject][ on agent]``.
-
-    Examples:
-      - "New user added: attacker_test on linux-ep-0"
-      - "Integrity checksum changed: /etc/passwd on linux-ep-0"
-      - "Authentication failure on linux-ep-0"
-    """
     base = (rule_desc or "Wazuh alert").strip().rstrip(".")
     if subject:
         base = f"{base}: {subject}"
     if agent_name:
-        base = f"{base} on {agent_name}"  ## agent name captured in agent, asset and identity context for title composition in initial triage
+        base = f"{base} on {agent_name}"
     return base[:255]
 
 
 _ALLOWED_ENTITY_TYPES = {"user", "host", "ip", "process", "hash", "domain", "port"}
 
 
-# To check involved accounts (Actor/Target) and harvest artifacts
 def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[dict]:
-    """Typed, role-carrying entities conforming strictly to the Wire Schema enum.
-
-    Allowed types: 'user', 'host', 'ip', 'process', 'hash', 'domain', 'port'.
-    Wazuh puts decoded fields under ``data`` (data.srcuser, data.srcip,
-    data.dstuser, data.win.eventdata.*). We map the common ones; unknown
-    shapes are simply not emitted rather than guessed.
-    """
     ents: list[dict] = []
 
     def add(t: str, v: Any, role: str | None, field: str) -> None:
@@ -364,21 +306,21 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
 
     data = src.get("data") or {}
     if isinstance(data, dict):
-        ### Data being fetched by initial triage phase for capturing agent, asset and identity context
-        # Perimeter firewall device attribution (e.g., FortiGate NPHYDFW01)
+        # Network & Firewalls
         if data.get("devname"):
             add("host", data.get("devname"), "target", "data.devname")
-
-        add("user", data.get("srcuser"), "actor", "data.srcuser")
-        add("user", data.get("dstuser"), "target", "data.dstuser")
-        add("user", data.get("user"), "actor", "data.user")
-        add("ip", data.get("srcip"), "src", "data.srcip")
-        add("ip", data.get("dstip"), "dst", "data.dstip")
+        add("ip", data.get("srcip") or data.get("SourceIP") or data.get("ClientIP"), "src", "data.srcip")
+        add("ip", data.get("dstip") or data.get("DestinationIP"), "dst", "data.dstip")
         add("port", data.get("srcport"), "src", "data.srcport")
         add("port", data.get("dstport"), "dst", "data.dstport")
+
+        # Identity & Office 365 / Cloud
+        add("user", data.get("srcuser") or data.get("Sender"), "actor", "data.srcuser")
+        add("user", data.get("dstuser") or data.get("Recipient"), "target", "data.dstuser")
+        add("user", data.get("user") or data.get("UserId"), "actor", "data.user")
         add("process", data.get("process") or data.get("command"), "actor", "data.process")
 
-        # Linux Auditd user identities
+        # Linux Auditd
         audit = data.get("audit") or {}
         if isinstance(audit, dict):
             add("user", audit.get("uid"), "actor", "data.audit.uid")
@@ -386,10 +328,11 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
             add("user", audit.get("auid"), "actor", "data.audit.auid")
             add("process", audit.get("exe") or audit.get("command"), "actor", "data.audit.exe")
 
-        # Network / Web artifacts (URLs & Domains)
-        if data.get("url"):
+        # Web & Domains
+        if data.get("url") or data.get("URL"):
+            url_val = str(data.get("url") or data.get("URL"))
             try:
-                parsed = urlparse(str(data["url"]))
+                parsed = urlparse(url_val)
                 if parsed.netloc:
                     add("domain", parsed.netloc.split(":")[0], "target", "data.url")
             except Exception:
@@ -397,7 +340,7 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
         if data.get("domain"):
             add("domain", data.get("domain"), "target", "data.domain")
 
-        # Windows EventData extraction (Sysmon & Security Logs)
+        # Windows EventData
         win = data.get("win") or {}
         if isinstance(win, dict):
             ev_data = win.get("eventdata") or {}
@@ -409,7 +352,7 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
                 if ev_data.get("queryName"):
                     add("domain", ev_data.get("queryName"), "target", "win.eventdata.queryName")
 
-    # FIM / Syscheck artifacts (Strictly mapping hashes to allowed 'hash' type)
+    # FIM / Syscheck
     syscheck = src.get("syscheck") or {}
     if isinstance(syscheck, dict):
         if syscheck.get("sha256_after"):
@@ -430,6 +373,7 @@ def _extract_entities(src: dict, agent: dict, agent_name: str | None) -> list[di
 def _extract_mitre(rule: dict, data: dict | None = None) -> dict:
     mitre = rule.get("mitre") or (data.get("mitre") if isinstance(data, dict) else {}) or {}
     groups = [str(g).lower() for g in (rule.get("groups") or [])]
+    rule_desc = str(rule.get("description") or "").lower()
 
     ids: list[str] = []
     tactics: list[str] = []
@@ -446,24 +390,32 @@ def _extract_mitre(rule: dict, data: dict | None = None) -> dict:
         tactics = _cap(mitre.get("tactic") or mitre.get("tactics"))
         techniques = _cap(mitre.get("technique") or mitre.get("techniques"))
 
-    # Dynamic fallback heuristics for unmapped rules
+    # Dynamic Fallback Heuristics for Unmapped Rules
     if not ids:
-        if "vulnerability-detector" in groups:
+        if any(g in groups for g in ("office365", "threatintelligence", "o365", "exchange")) or "phish" in rule_desc:
+            ids = ["T1566", "T1566.002", "T1204"]
+            tactics = ["initial-access", "execution"]
+            techniques = ["Phishing", "Spearphishing Link", "User Execution"]
+        elif "vulnerability-detector" in groups:
             ids = ["T1190"]
             tactics = ["initial-access"]
             techniques = ["Exploit Public-Facing Application"]
-        elif "postgresql_dam" in groups or "postgresql" in groups:
-            ids = ["T1078", "T1190"]
-            tactics = ["initial-access", "credential-access"]
-            techniques = ["Valid Accounts", "Exploit Public-Facing Application"]
-        elif "sysmon" in groups or "windows" in groups:
+        elif any(g in groups for g in ("fortigate", "firewall", "ips", "attack")) or "attack" in rule_desc:
+            ids = ["T1190", "T1059"]
+            tactics = ["initial-access", "execution"]
+            techniques = ["Exploit Public-Facing Application", "Command and Scripting Interpreter"]
+        elif any(g in groups for g in ("sysmon", "windows", "powershell")):
             ids = ["T1059"]
             tactics = ["execution"]
             techniques = ["Command and Scripting Interpreter"]
-        elif "authentication_failed" in groups or "sshd" in groups:
+        elif any(g in groups for g in ("authentication_failed", "sshd", "pam", "invalid_login")):
             ids = ["T1110"]
             tactics = ["credential-access"]
             techniques = ["Brute Force"]
+        elif "syscheck" in groups or "fim" in groups:
+            ids = ["T1565"]
+            tactics = ["impact"]
+            techniques = ["Data Manipulation"]
 
     return {
         "ids": ids,
@@ -472,11 +424,27 @@ def _extract_mitre(rule: dict, data: dict | None = None) -> dict:
     }
 
 
+def _extract_action(src: dict, data: dict, full_log: str) -> str | None:
+    """Dynamically determine security action / disposition."""
+    for field in ("action", "Action", "status", "disposition", "verdict", "Verdict"):
+        if data.get(field):
+            return str(data[field]).lower()
+        if src.get(field):
+            return str(src[field]).lower()
+
+    # Dynamic regex parse from log text
+    if full_log:
+        m = re.search(r'\b(?:action|status|disposition|verdict)=["\']?([a-zA-Z0-9_\-]+)["\']?', full_log, re.I)
+        if m:
+            return m.group(1).lower()
+    return None
+
+
 def _extract_full_log(src: dict, rule: dict) -> str:
     data = src.get("data") or {}
     base_log = ""
 
-    # 1. Direct root or nested full_log / raw string
+    # 1. Direct root or nested full_log string
     if src.get("full_log"):
         base_log = str(src["full_log"])
     elif isinstance(data, dict):
@@ -493,7 +461,7 @@ def _extract_full_log(src: dict, rule: dict) -> str:
         elif (data.get("audit") or {}).get("command"):
             base_log = str((data.get("audit") or {}).get("command"))
 
-        # 2. Vulnerability Findings
+        # Vulnerability Findings
         elif data.get("vulnerability"):
             vuln = data["vulnerability"]
             if isinstance(vuln, dict):
@@ -503,18 +471,21 @@ def _extract_full_log(src: dict, rule: dict) -> str:
                 title = vuln.get("title") or ""
                 base_log = f"{cve} affecting {pkg} {ver} - {title}".strip(" -")
 
-    # 3. Fallback to rule description + serialized telemetry if available
-    if not base_log:
-        desc = str(rule.get("description") or "")
-        if isinstance(data, dict) and data:
-            try:
-                base_log = f"{desc} | Telemetry: {json.dumps(data, default=str)}"
-            except Exception:
+    # 2. Dynamic Telemetry Serialization for Short/O365 Logs
+    desc = str(rule.get("description") or "")
+    if isinstance(data, dict) and data:
+        # If base_log is minimal or identical to description, assemble key telemetry fields dynamically
+        if not base_log or base_log.strip().rstrip(".") == desc.strip().rstrip("."):
+            kv_pairs = [f'{k}="{v}"' if " " in str(v) else f"{k}={v}" for k, v in data.items() if not isinstance(v, (dict, list))]
+            if kv_pairs:
+                base_log = f"{desc} | Telemetry: {' '.join(kv_pairs)}"
+            else:
                 base_log = desc
-        else:
-            base_log = desc
 
-    # 4. Append Composite Burst history (Wazuh previous_output) to preserve multi-event context without truncation
+    if not base_log:
+        base_log = desc
+
+    # 3. Append Composite Burst history
     prev_output = src.get("previous_output")
     if prev_output:
         firedtimes = rule.get("firedtimes", 1)
@@ -530,7 +501,7 @@ def _hit_to_event(hit: dict) -> dict | None:
         return None
     rule = src.get("rule") or {}
     agent = src.get("agent") or {}
-    data = src.get("data") or {}
+    data = src.get("data") if isinstance(src.get("data"), dict) else {}
     rule_desc = rule.get("description") or ""
     agent_name = agent.get("name") if isinstance(agent, dict) else None
     agent_id = str(agent.get("id") or "") if isinstance(agent, dict) else ""
@@ -540,17 +511,16 @@ def _hit_to_event(hit: dict) -> dict | None:
     if agent_name:
         asset_ids.append(agent_name[:64])
 
-    # Add network appliance devname if present in data
-    if isinstance(data, dict) and data.get("devname"):
+    if data.get("devname"):
         dev = str(data["devname"])[:64]
         if dev not in asset_ids:
             asset_ids.append(dev)
 
     full_log = _extract_full_log(src, rule)
-    iocs = _extract_iocs(f"{rule_desc} {full_log}", data if isinstance(data, dict) else None)
+    iocs = _extract_iocs(f"{rule_desc} {full_log}", data)
     entities = _extract_entities(src, agent, agent_name)
+    action = _extract_action(src, data, full_log)
 
-    # Perimeter appliance name resolution (e.g. FortiGate via Agent 000 syslog)
     if agent_id == "000":
         dev_m = re.search(r'\b(?:devname|hostname|host|dvc)=["\']?([A-Za-z0-9_\-.]{3,64})["\']?', full_log)
         if dev_m:
@@ -561,9 +531,7 @@ def _hit_to_event(hit: dict) -> dict | None:
     full_log_red = redact_text(full_log)[:4096] if full_log else ""
     rule_desc_red = redact_text(rule_desc)[:512] if rule_desc else ""
     description = rule_desc_red or redact_text(full_log.strip())[:1024] or None
-    title = redact_text(
-        _compose_title(rule_desc, agent_name, _extract_subject(full_log))
-    )
+    title = redact_text(_compose_title(rule_desc, agent_name, _extract_subject(full_log)))
     thash = template_hash(full_log_red)
 
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -578,8 +546,9 @@ def _hit_to_event(hit: dict) -> dict | None:
         "observed_at": now_iso,
         "description": description,
         "title": title,
+        "action": action,
         "entities": entities,
-        "mitre": _extract_mitre(rule, data if isinstance(data, dict) else None),
+        "mitre": _extract_mitre(rule, data),
         "rule_groups": [str(g)[:64] for g in (rule.get("groups") or [])][:16],
         "decoder": (src.get("decoder") or {}).get("name"),
         "full_log": full_log_red,
@@ -594,9 +563,9 @@ def _hit_to_event(hit: dict) -> dict | None:
             "location": src.get("location"),
             "manager_name": (src.get("manager") or {}).get("name"),
             "full_log": full_log_red,
-            "action": (data.get("action") if isinstance(data, dict) else None),
+            "action": action,
             "firedtimes": rule.get("firedtimes", 1),
-            "raw_source": src,  # Preserves complete unflattened telemetry for deep graph investigation
+            "raw_source": src,
         },
     }
 
@@ -661,15 +630,23 @@ async def _load_checkpoint(
         _state.last_alert_id = cp.get("cursor_event_id")
         _state.batch_seq = int(cp.get("batch_seq") or 0)
         _state.checkpoint_loaded = True
-        logger.info("checkpoint_loaded cursor=%s id=%s batch_seq=%d",
-                    _state.last_alert_ts, _state.last_alert_id, _state.batch_seq)
-    except Exception as e:  # noqa: BLE001
+        logger.info(
+            "checkpoint_loaded cursor=%s id=%s batch_seq=%d",
+            _state.last_alert_ts,
+            _state.last_alert_id,
+            _state.batch_seq,
+        )
+    except Exception as e:
         logger.warning("checkpoint_load_failed: %s (starting from local cursor)", e)
 
 
 async def _save_checkpoint(
-    client: httpx.AsyncClient, api_url: str, tenant_id: str, token: str,
-    cursor_ts: str, cursor_event_id: str | None,
+    client: httpx.AsyncClient,
+    api_url: str,
+    tenant_id: str,
+    token: str,
+    cursor_ts: str,
+    cursor_event_id: str | None,
 ) -> None:
     try:
         resp = await client.put(
@@ -686,7 +663,7 @@ async def _save_checkpoint(
             timeout=10.0,
         )
         resp.raise_for_status()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("checkpoint_save_failed: %s", e)
 
 
@@ -706,8 +683,7 @@ async def _heartbeat_once(client: httpx.AsyncClient) -> None:
     resp = await client.post(
         f"{api_url}/api/internal/adapter/heartbeat",
         headers={"Authorization": f"Bearer {token}"},
-        json={"tenant_id": tenant_id, "version": VERSION, "health": "ok",
-              "metrics": metrics},
+        json={"tenant_id": tenant_id, "version": VERSION, "health": "ok", "metrics": metrics},
         timeout=10.0,
     )
     resp.raise_for_status()
@@ -722,7 +698,7 @@ async def _heartbeat_loop() -> None:
                 _state.last_heartbeat_ok = datetime.now(timezone.utc)
                 _state.last_heartbeat_error = None
                 logger.info("heartbeat_ok")
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 _state.last_heartbeat_error = str(e)
                 logger.warning("heartbeat_failed: %s", e)
             await asyncio.sleep(interval)
@@ -781,7 +757,9 @@ async def _ingest_loop() -> None:
                             _state.alerts_dropped_rate_limit += dropped
                             logger.warning(
                                 "rate_limited dropped=%d total_dropped=%d batch=%d",
-                                dropped, _state.alerts_dropped_rate_limit, len(events),
+                                dropped,
+                                _state.alerts_dropped_rate_limit,
+                                len(events),
                             )
                         events = events[:allowed]
 
@@ -805,24 +783,29 @@ async def _ingest_loop() -> None:
                         _state.alerts_forwarded += len(events) - dup
                         _state.last_ingest_error = None
 
-                    # Advance + persist the keyset cursor whether we forwarded
-                    # or shed the whole batch — either way those hits are done.
                     if (new_cursor_ts, new_cursor_id) != (
-                        _state.last_alert_ts, _state.last_alert_id
+                        _state.last_alert_ts,
+                        _state.last_alert_id,
                     ):
                         _state.last_alert_ts = new_cursor_ts
                         _state.last_alert_id = new_cursor_id
                         await _save_checkpoint(
-                            api_client, api_url, tenant_id, token,
-                            new_cursor_ts, new_cursor_id,
+                            api_client,
+                            api_url,
+                            tenant_id,
+                            token,
+                            new_cursor_ts,
+                            new_cursor_id,
                         )
                         logger.info(
                             "ingest_ok forwarded=%d duplicate=%d total=%d cursor=%s/%s",
-                            _state.alerts_forwarded, _state.alerts_duplicate,
-                            _state.alerts_forwarded, new_cursor_ts, new_cursor_id,
+                            _state.alerts_forwarded,
+                            _state.alerts_duplicate,
+                            _state.alerts_forwarded,
+                            new_cursor_ts,
+                            new_cursor_id,
                         )
             except httpx.HTTPStatusError as e:
-                # Capture exact FastAPI/Pydantic validation details on 422
                 error_detail = e.response.text
                 _state.last_ingest_error = f"{e} | Response: {error_detail}"
                 logger.error(
