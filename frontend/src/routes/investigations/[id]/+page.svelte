@@ -19,6 +19,7 @@
 	let cancelReason = '';
 	let expandedEvents: Set<string> = new Set();
 	let copiedLogId: string | null = null;
+	let eventViewMode: Record<string, 'table' | 'json'> = {};
 
 	// Safe reactive extraction for Jira Key and SOP Verdict without in-template TypeScript casting
 	$: jiraIssueKey = (investigation as Record<string, any> | null)?.jira_issue_key;
@@ -26,13 +27,102 @@
 		|| (investigation as Record<string, any> | null)?.enrichments?.sop_verdict 
 		|| (investigation as Record<string, any> | null)?.verdict?.sop_verdict;
 
-	function toggleEventDetails(eventId: string) {
-		if (expandedEvents.has(eventId)) {
-			expandedEvents.delete(eventId);
+	// Reactive OODA Pipeline Stage Determination
+	$: oodaStages = (() => {
+		if (!investigation) return [];
+		const status = investigation.status || '';
+		const phase = (investigation.phase || '').toLowerCase();
+		const hasObservables = (investigation.observable_count || 0) > 0;
+		const hasVerdict = Boolean(investigation.verdict_decision || sopVerdict || (investigation as Record<string, any> | null)?.verdict);
+		const isActDone = ['closed', 'auto_closed', 'auto_closed_fp', 'closed_fp', 'closed_tp', 'escalated'].includes(status) 
+			|| Boolean((investigation as Record<string, any> | null)?.thehive_case_id || jiraIssueKey);
+
+		return [
+			{
+				step: '1',
+				name: 'Observe',
+				title: 'Telemetry & Asset Context',
+				isDone: true,
+				isActive: phase === 'observe' || phase === 'triage'
+			},
+			{
+				step: '2',
+				name: 'Orient',
+				title: 'Threat Intel & Artifacts',
+				isDone: hasObservables || ['orient', 'analysis', 'investigating'].includes(phase) || hasVerdict,
+				isActive: phase === 'orient' || phase === 'analysis' || phase === 'investigating'
+			},
+			{
+				step: '3',
+				name: 'Decide',
+				title: 'LangGraph Reasoning & SOP',
+				isDone: hasVerdict,
+				isActive: phase === 'decide' || phase === 'verdict'
+			},
+			{
+				step: '4',
+				name: 'Act',
+				title: 'TheHive & Ticket Dispatch',
+				isDone: isActDone,
+				isActive: phase === 'act' || phase === 'remediation' || status === 'escalated'
+			}
+		];
+	})();
+
+	function getEventKey(event: InvestigationTimelineEvent, index: number): string {
+		return event.id || (event as Record<string, any>).event_id || String(index);
+	}
+
+	function toggleEventDetails(key: string) {
+		if (expandedEvents.has(key)) {
+			expandedEvents.delete(key);
 		} else {
-			expandedEvents.add(eventId);
+			expandedEvents.add(key);
 		}
 		expandedEvents = new Set(expandedEvents);
+	}
+
+	function setViewMode(key: string, mode: 'table' | 'json') {
+		eventViewMode = { ...eventViewMode, [key]: mode };
+	}
+
+	interface MetadataRow {
+		key: string;
+		value: string;
+	}
+
+	function getStructuredMetadata(data: Record<string, unknown> | undefined): MetadataRow[] {
+		if (!data) return [];
+		const rows: MetadataRow[] = [];
+
+		function flatten(obj: Record<string, unknown>, prefix = '') {
+			for (const [k, v] of Object.entries(obj)) {
+				if (k === 'full_log' || k === 'raw_log') continue;
+				
+				if (k === 'raw' && typeof v === 'object' && v !== null && 'full_log' in (v as Record<string, unknown>)) {
+					const { full_log, ...restRaw } = v as Record<string, unknown>;
+					if (Object.keys(restRaw).length > 0) {
+						flatten(restRaw, prefix ? `${prefix}.${k}` : k);
+					}
+					continue;
+				}
+
+				const fieldKey = prefix ? `${prefix}.${k}` : k;
+				if (v === null || v === undefined) {
+					rows.push({ key: fieldKey, value: 'null' });
+				} else if (Array.isArray(v)) {
+					const valStr = v.map((item) => (typeof item === 'object' && item !== null ? JSON.stringify(item) : String(item))).join(', ');
+					rows.push({ key: fieldKey, value: valStr || '[]' });
+				} else if (typeof v === 'object') {
+					flatten(v as Record<string, unknown>, fieldKey);
+				} else {
+					rows.push({ key: fieldKey, value: String(v) });
+				}
+			}
+		}
+
+		flatten(data);
+		return rows;
 	}
 
 	function copyToClipboard(text: string, id: string) {
@@ -42,6 +132,20 @@
 		setTimeout(() => {
 			if (copiedLogId === id) copiedLogId = null;
 		}, 2500);
+	}
+
+	function extractRawLog(data: Record<string, unknown> | undefined): string {
+		if (!data) return '';
+		if (data.full_log) return String(data.full_log);
+		if (data.raw_log) return String(data.raw_log);
+		if (data.raw) {
+			if (typeof data.raw === 'object' && data.raw !== null && 'full_log' in (data.raw as Record<string, unknown>)) {
+				const rawObj = data.raw as Record<string, unknown>;
+				if (rawObj.full_log) return String(rawObj.full_log);
+			}
+			return typeof data.raw === 'string' ? data.raw : JSON.stringify(data.raw, null, 2);
+		}
+		return '';
 	}
 
 	function formatEventSummary(eventType: string, data: Record<string, unknown>): string {
@@ -56,8 +160,12 @@
 					titleText = data.rule_id ? `Rule ${data.rule_id}` : 'Wazuh Alert';
 				}
 				
-				const count = data.event_count && Number(data.event_count) > 1 ? ` (${data.event_count} events coalesced)` : '';
-				return `Alert Ingested: ${titleText}${count}`;
+				const firedTimes = data.fired_times || data.firedtimes || (data.raw as Record<string, any> | undefined)?.firedtimes;
+				const burstCount = firedTimes && Number(firedTimes) > 1 
+					? ` (${firedTimes}x bursts)` 
+					: (data.event_count && Number(data.event_count) > 1 ? ` (${data.event_count} events coalesced)` : '');
+				
+				return `Alert Ingested: ${titleText}${burstCount}`;
 			}
 			case 'investigation.created':
 				return `Investigation started: "${data.title || 'Untitled'}"`;
@@ -121,17 +229,41 @@
 		}
 	}
 
-	function getEventDetails(eventType: string, data: Record<string, unknown>): Array<{label: string, value: string, highlight?: boolean, tooltip?: string}> {
-		const details: Array<{label: string, value: string, highlight?: boolean, tooltip?: string}> = [];
+	function getEventDetails(eventType: string, data: Record<string, unknown>): Array<{label: string, value: string, highlight?: boolean, tooltip?: string, badgeClass?: string}> {
+		const details: Array<{label: string, value: string, highlight?: boolean, tooltip?: string, badgeClass?: string}> = [];
 
 		switch (eventType) {
 			case 'alert_ingested':
 			case 'alert.ingested':
 			case 'alert.added':
-			case 'alert.correlated':
+			case 'alert.correlated': {
 				if (data.rule_id) details.push({ label: 'Rule ID', value: String(data.rule_id) });
 				if (data.severity) details.push({ label: 'Severity', value: String(data.severity).toUpperCase(), highlight: Number(data.severity) >= 8 });
-				if (data.event_count && Number(data.event_count) > 1) details.push({ label: 'Coalesced Count', value: `${data.event_count}x` });
+				
+				const action = data.action || (data.raw as Record<string, any> | undefined)?.action;
+				if (action && String(action).toLowerCase() !== 'unknown') {
+					const actionStr = String(action).toUpperCase();
+					const isDropped = actionStr === 'DROPPED' || actionStr === 'BLOCKED' || actionStr === 'DENIED';
+					details.push({
+						label: 'Action',
+						value: actionStr,
+						highlight: !isDropped,
+						badgeClass: isDropped ? 'text-emerald-400 font-bold' : 'text-error-400 font-bold'
+					});
+				}
+
+				const firedTimes = data.fired_times || data.firedtimes || (data.raw as Record<string, any> | undefined)?.firedtimes;
+				if (firedTimes && Number(firedTimes) > 1) {
+					details.push({ 
+						label: 'Burst', 
+						value: `${firedTimes}x Events`, 
+						highlight: true,
+						badgeClass: 'text-amber-300 font-semibold'
+					});
+				} else if (data.event_count && Number(data.event_count) > 1) {
+					details.push({ label: 'Coalesced', value: `${data.event_count}x` });
+				}
+
 				if (data.asset_ids && Array.isArray(data.asset_ids) && data.asset_ids.length > 0) {
 					details.push({ label: 'Assets', value: (data.asset_ids as string[]).join(', ') });
 				}
@@ -157,6 +289,7 @@
 				}
 				if (data.source_event_id) details.push({ label: 'Event ID', value: String(data.source_event_id) });
 				break;
+			}
 
 			case 'investigation.created':
 				if (data.alert_ids) details.push({ label: 'Alerts', value: `${(data.alert_ids as string[]).length} alerts` });
@@ -425,6 +558,7 @@
 		</div>
 	</div>
 
+	<!-- Primary KPI Summary Metrics (Immediate Visibility) -->
 	<div class="grid grid-cols-2 lg:grid-cols-6 gap-4 mb-6">
 		<div class="card p-3">
 			<h4 class="text-xs opacity-60">Alerts</h4>
@@ -546,15 +680,16 @@
 				</div>
 			{/if}
 
-			{#if investigation.tokens_used !== null && investigation.tokens_used !== undefined}
-				{#if !$isCustomerScope}
-					<div class="card p-4">
-						<h3 class="h4 mb-4">Agent Run</h3>
-						<div class="space-y-3">
+			<!-- Agent Run Card with Unified OODA Stepper -->
+			<div class="card p-4">
+				<h3 class="h4 mb-4">Agent Run</h3>
+				<div class="space-y-4">
+					{#if investigation.tokens_used !== null && investigation.tokens_used !== undefined}
+						{#if !$isCustomerScope}
 							<div>
 								<div class="flex justify-between text-sm mb-1">
 									<span class="opacity-60">Token Spend</span>
-									<span class="font-mono">
+									<span class="font-mono text-xs">
 										{investigation.tokens_used?.toLocaleString() ?? 0}
 										{#if investigation.tokens_budget}
 											/ {investigation.tokens_budget.toLocaleString()}
@@ -580,10 +715,31 @@
 									</span>
 								</div>
 							{/if}
+						{/if}
+					{/if}
+
+					<!-- Compact OODA Pipeline Status -->
+					<div class="pt-2 border-t border-surface-700/60">
+						<span class="text-xs font-semibold opacity-60 uppercase tracking-wider block mb-2">OODA Stage</span>
+						<div class="space-y-1.5">
+							{#each oodaStages as stage}
+								<div class="flex items-center justify-between text-xs p-1.5 rounded bg-surface-900/60 border border-surface-700/40">
+									<span class="font-medium {stage.isDone ? 'text-primary-300' : 'text-surface-400'}">
+										{stage.step}. {stage.name}
+									</span>
+									{#if stage.isDone}
+										<span class="text-[10px] text-emerald-400 font-mono font-bold">READY</span>
+									{:else if stage.isActive}
+										<span class="text-[10px] text-amber-300 font-mono animate-pulse font-bold">RUNNING</span>
+									{:else}
+										<span class="text-[10px] text-surface-500 font-mono">PENDING</span>
+									{/if}
+								</div>
+							{/each}
 						</div>
 					</div>
-				{/if}
-			{/if}
+				</div>
+			</div>
 
 			<div class="card p-4">
 				<h3 class="h4 mb-4">Observable Summary</h3>
@@ -636,8 +792,10 @@
 				{:else if events.length === 0}
 					<p class="opacity-60 text-center py-8">No events recorded</p>
 				{:else}
-					<div class="space-y-4 max-h-[650px] overflow-y-auto pr-2">
+					<div class="space-y-4 max-h-[calc(100vh-14rem)] overflow-y-auto pr-2">
 						{#each events as event, i}
+							{@const eventKey = getEventKey(event, i)}
+							{@const currentMode = eventViewMode[eventKey] || 'json'}
 							{@const details = getEventDetails(event.event_type, event.data)}
 							<div class="flex gap-3">
 								<div class="flex flex-col items-center">
@@ -668,7 +826,7 @@
 													title={detail.tooltip || detail.value}
 												>
 													<span class="opacity-50 font-medium">{detail.label}:</span>
-													<span class={detail.highlight ? 'text-error-400 font-semibold' : 'text-surface-200'}>{detail.value}</span>
+													<span class="{detail.badgeClass || (detail.highlight ? 'text-error-400 font-semibold' : 'text-surface-200')}">{detail.value}</span>
 												</span>
 											{/each}
 										</div>
@@ -676,55 +834,107 @@
 
 									<button
 										class="text-xs opacity-60 hover:opacity-100 flex items-center gap-1 transition-opacity"
-										on:click={() => toggleEventDetails(event.id)}
+										on:click={() => toggleEventDetails(eventKey)}
 									>
 										<svg
 											xmlns="http://www.w3.org/2000/svg"
-											class="h-3 w-3 transition-transform {expandedEvents.has(event.id) ? 'rotate-90' : ''}"
+											class="h-3 w-3 transition-transform {expandedEvents.has(eventKey) ? 'rotate-90' : ''}"
 											fill="none"
 											viewBox="0 0 24 24"
 											stroke="currentColor"
 										>
 											<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
 										</svg>
-										{expandedEvents.has(event.id) ? 'Hide' : 'Show'} raw data
+										{expandedEvents.has(eventKey) ? 'Hide' : 'Show'} raw data
 									</button>
 
-									{#if expandedEvents.has(event.id)}
-										<div class="mt-2 rounded-lg bg-surface-900 border border-surface-700 p-3 space-y-3">
-											{#if event.data?.full_log || event.data?.raw_log || event.data?.raw}
-												{@const rawLog = String(event.data.full_log || event.data.raw_log || event.data.raw)}
-												<div class="flex items-center justify-between pb-2 border-b border-surface-700">
-													<span class="text-xs font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
-														<span class="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-														Raw Wazuh Telemetry (full_log)
-													</span>
-													<button
-														type="button"
-														on:click={() => copyToClipboard(rawLog, event.id)}
-														class="btn btn-sm variant-soft-primary text-xs py-1 px-2.5"
-													>
-														{copiedLogId === event.id ? '✅ Copied to Clipboard!' : '📋 Copy Log'}
-													</button>
+									{#if expandedEvents.has(eventKey)}
+										<div class="mt-2 rounded-lg bg-surface-900 border border-surface-700 p-4 space-y-4">
+											{#if extractRawLog(event.data)}
+												{@const rawLog = extractRawLog(event.data)}
+												<div class="space-y-2">
+													<div class="flex items-center justify-between pb-1 border-b border-surface-700">
+														<span class="text-xs font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+															<span class="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+															Raw Wazuh Telemetry (full_log)
+														</span>
+														<button
+															type="button"
+															on:click={() => copyToClipboard(rawLog, eventKey)}
+															class="btn btn-sm variant-soft-primary text-xs py-1 px-2.5"
+														>
+															{copiedLogId === eventKey ? '✅ Copied to Clipboard!' : '📋 Copy Log'}
+														</button>
+													</div>
+													<pre class="overflow-y-auto rounded bg-black/70 p-3.5 font-mono text-xs text-emerald-400 whitespace-pre-wrap break-all max-h-80 selection:bg-emerald-900 selection:text-white border border-surface-700/80 leading-relaxed">{rawLog}</pre>
 												</div>
-												<pre class="overflow-x-auto rounded bg-black/60 p-3 font-mono text-xs text-emerald-400 whitespace-pre-wrap selection:bg-emerald-900 selection:text-white border border-surface-700">{rawLog}</pre>
 											{/if}
 
-											<details open={!event.data?.full_log && !event.data?.raw_log && !event.data?.raw}>
-												<summary class="text-xs text-surface-400 cursor-pointer hover:text-surface-200 font-medium flex items-center justify-between">
-													<span>Structured Event Metadata JSON</span>
-												</summary>
-												<div class="mt-2 flex justify-end">
-													<button
-														type="button"
-														on:click={() => copyToClipboard(JSON.stringify(event.data, null, 2), `${event.id}-json`)}
-														class="btn btn-sm variant-soft text-xs py-0.5 px-2 mb-1"
-													>
-														{copiedLogId === `${event.id}-json` ? '✅ Copied JSON!' : '📋 Copy JSON'}
-													</button>
+											<!-- Directly Open Structured Metadata (Reactive Table & JSON Switch) -->
+											<div class="pt-2 border-t border-surface-700/60 space-y-2">
+												<div class="flex items-center justify-between">
+													<span class="text-xs font-semibold uppercase tracking-wider text-surface-300">
+														Structured Event Metadata
+													</span>
+													<div class="flex items-center gap-2">
+														<div class="inline-flex rounded-md shadow-sm border border-surface-700 overflow-hidden text-xs">
+															<button
+																type="button"
+																class="px-2.5 py-0.5 font-medium transition-colors {currentMode === 'json' ? 'bg-primary-600 text-white' : 'bg-surface-800 text-surface-300 hover:bg-surface-700'}"
+																on:click={() => setViewMode(eventKey, 'json')}
+															>
+																JSON
+															</button>
+															<button
+																type="button"
+																class="px-2.5 py-0.5 font-medium transition-colors border-l border-surface-700 {currentMode === 'table' ? 'bg-primary-600 text-white' : 'bg-surface-800 text-surface-300 hover:bg-surface-700'}"
+																on:click={() => setViewMode(eventKey, 'table')}
+															>
+																Table
+															</button>
+														</div>
+														<button
+															type="button"
+															on:click={() => copyToClipboard(JSON.stringify(event.data, null, 2), `${eventKey}-json`)}
+															class="btn btn-sm variant-soft text-xs py-0.5 px-2"
+														>
+															{copiedLogId === `${eventKey}-json` ? '✅ Copied JSON!' : '📋 Copy JSON'}
+														</button>
+													</div>
 												</div>
-												<pre class="text-xs overflow-x-auto whitespace-pre-wrap font-mono text-surface-300 bg-black/40 p-3 rounded border border-surface-700/60">{JSON.stringify(event.data, null, 2)}</pre>
-											</details>
+
+												{#if currentMode === 'json'}
+													<pre class="text-xs overflow-y-auto whitespace-pre-wrap break-all font-mono text-surface-300 bg-black/60 p-3.5 rounded border border-surface-700/80 max-h-[480px] leading-relaxed select-all">{JSON.stringify(event.data, null, 2)}</pre>
+												{:else}
+													{@const metaRows = getStructuredMetadata(event.data)}
+													{#if metaRows.length > 0}
+														<div class="max-h-[480px] overflow-y-auto rounded border border-surface-700/80 bg-black/50">
+															<table class="w-full text-left border-collapse">
+																<thead class="sticky top-0 bg-surface-800 border-b border-surface-700 z-10">
+																	<tr class="text-[11px] text-surface-400 uppercase tracking-wider">
+																		<th class="py-2 px-3 font-semibold w-1/3">Field</th>
+																		<th class="py-2 px-3 font-semibold">Value</th>
+																	</tr>
+																</thead>
+																<tbody class="divide-y divide-surface-800 text-xs">
+																	{#each metaRows as row}
+																		<tr class="hover:bg-surface-800/50 transition-colors">
+																			<td class="py-1.5 px-3 font-mono text-primary-300 whitespace-nowrap align-top select-all font-medium">
+																				{row.key}
+																			</td>
+																			<td class="py-1.5 px-3 font-mono text-surface-200 break-all select-all">
+																				{row.value}
+																			</td>
+																		</tr>
+																	{/each}
+																</tbody>
+															</table>
+														</div>
+													{:else}
+														<p class="text-xs opacity-60 italic py-2">No structured metadata attributes found.</p>
+													{/if}
+												{/if}
+											</div>
 										</div>
 									{/if}
 								</div>
