@@ -243,7 +243,7 @@
 				const action = data.action || (data.raw as Record<string, any> | undefined)?.action;
 				if (action && String(action).toLowerCase() !== 'unknown') {
 					const actionStr = String(action).toUpperCase();
-					const isDropped = actionStr === 'DROPPED' || actionStr === 'BLOCKED' || actionStr === 'DENIED';
+					const isDropped = actionStr === 'DROPPED' || actionStr === 'BLOCKED' || actionStr === 'DENIED' || actionStr === 'QUARANTINED';
 					details.push({
 						label: 'Action',
 						value: actionStr,
@@ -265,7 +265,15 @@
 				}
 
 				if (data.asset_ids && Array.isArray(data.asset_ids) && data.asset_ids.length > 0) {
-					details.push({ label: 'Assets', value: (data.asset_ids as string[]).join(', ') });
+					const assets = data.asset_ids as string[];
+					const displayAssets = assets.length > 3 
+						? `${assets.slice(0, 3).join(', ')} (+${assets.length - 3} more)` 
+						: assets.join(', ');
+					details.push({ 
+						label: 'Assets', 
+						value: displayAssets,
+						tooltip: assets.join(', ')
+					});
 				}
 				if (data.mitre && typeof data.mitre === 'object') {
 					const mitreObj = data.mitre as Record<string, unknown>;
@@ -284,8 +292,35 @@
 					});
 				}
 				if (data.initial_iocs && Array.isArray(data.initial_iocs) && data.initial_iocs.length > 0) {
-					const iocVals = (data.initial_iocs as any[]).map((i: any) => (typeof i === 'object' && i !== null ? i.value : i)).filter(Boolean);
-					if (iocVals.length > 0) details.push({ label: 'IOCs', value: iocVals.join(', '), highlight: true });
+					const iocVals = (data.initial_iocs as any[])
+						.map((i: any) => (typeof i === 'object' && i !== null ? i.value : i))
+						.filter(Boolean);
+					if (iocVals.length > 0) {
+						const formatIoc = (val: string) => {
+							const s = String(val);
+							if (s.startsWith('http://') || s.startsWith('https://')) {
+								try {
+									const u = new URL(s);
+									const pathSnippet = u.pathname.length > 15 ? u.pathname.slice(0, 15) + '...' : u.pathname;
+									return `${u.hostname}${pathSnippet}`;
+								} catch {
+									return s.length > 30 ? s.slice(0, 30) + '...' : s;
+								}
+							}
+							return s.length > 30 ? s.slice(0, 30) + '...' : s;
+						};
+
+						const displayIocs = iocVals.length > 2
+							? `${iocVals.slice(0, 2).map(formatIoc).join(', ')} (+${iocVals.length - 2} more)`
+							: iocVals.map(formatIoc).join(', ');
+
+						details.push({
+							label: 'IOCs',
+							value: displayIocs,
+							highlight: true,
+							tooltip: iocVals.join('\n')
+						});
+					}
 				}
 				if (data.source_event_id) details.push({ label: 'Event ID', value: String(data.source_event_id) });
 				break;
