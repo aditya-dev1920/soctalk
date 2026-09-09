@@ -18,6 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
+### Install uv and uvx for dynamic MCP server loading (e.g., mcp-abuseipdb)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
 ### Create MCP servers directory
 RUN mkdir -p /opt/mcp-servers
 

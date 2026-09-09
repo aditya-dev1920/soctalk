@@ -17,6 +17,7 @@ class MCPServerConfig(BaseModel):
     name: str
     path: Path
     env_vars: dict[str, str] = Field(default_factory=dict)
+    args: list[str] = Field(default_factory=list)
 
 
 class LLMConfig(BaseModel):
@@ -60,6 +61,8 @@ class Config(BaseModel):
     cortex_mcp_server: MCPServerConfig
     thehive_mcp_server: MCPServerConfig
     misp_mcp_server: MCPServerConfig
+    jira_mcp_server: MCPServerConfig
+    virustotal_mcp_server: MCPServerConfig
 
     # LLM settings
     llm: LLMConfig
@@ -284,6 +287,43 @@ def load_config(env_file: Optional[Path] = None) -> Config:
         },
     )
 
+    # Jira MCP Server config (optional Python-based MCP server)
+    jira_config = MCPServerConfig(
+        name="jira",
+        path=Path(
+            os.getenv(
+                "JIRA_MCP_SERVER_PATH",
+                str(base_path / "mcp-servers" / "jira" / "jira.py"),
+            )
+        ),
+        env_vars={
+            "JIRA_ENABLED": os.getenv("JIRA_ENABLED", "true"),
+            "JIRA_URL": (os.getenv("JIRA_URL") or "").rstrip("/"),
+            "JIRA_EMAIL": os.getenv("JIRA_EMAIL") or os.getenv("JIRA_USERNAME", ""),
+            "JIRA_API_TOKEN": os.getenv("JIRA_API_TOKEN", ""),
+            "JIRA_BEARER_TOKEN": os.getenv("JIRA_BEARER_TOKEN", ""),
+            "JIRA_DEFAULT_PROJECT": os.getenv("JIRA_DEFAULT_PROJECT") or os.getenv("JIRA_PROJECT_KEY", "SEC"),
+            "JIRA_CUSTOM_FIELDS_JSON": os.getenv("JIRA_CUSTOM_FIELDS_JSON", ""),
+            "JIRA_VERIFY_SSL": os.getenv("JIRA_VERIFY_SSL", "true"),
+        },
+    )
+
+    # VirusTotal MCP Server config (optional Python-based MCP server)
+    virustotal_config = MCPServerConfig(
+        name="virustotal",
+        path=Path(
+            os.getenv(
+                "VIRUSTOTAL_MCP_SERVER_PATH",
+                str(base_path / "mcp-servers" / "virustotal" / "virustotal.py"),
+            )
+        ),
+        env_vars={
+            "VIRUSTOTAL_ENABLED": os.getenv("VIRUSTOTAL_ENABLED", "true"),
+            "VIRUSTOTAL_API_KEY": os.getenv("VIRUSTOTAL_API_KEY") or os.getenv("VT_API_KEY", ""),
+            "VT_REQUESTS_PER_MIN": os.getenv("VT_REQUESTS_PER_MIN") or os.getenv("VIRUSTOTAL_RPM", "4"),
+        },
+    )
+
     def _optional_env(name: str) -> Optional[str]:
         value = os.getenv(name)
         if value is None:
@@ -385,6 +425,8 @@ def load_config(env_file: Optional[Path] = None) -> Config:
         cortex_mcp_server=cortex_config,
         thehive_mcp_server=thehive_config,
         misp_mcp_server=misp_config,
+        jira_mcp_server=jira_config,
+        virustotal_mcp_server=virustotal_config,
         llm=llm_config,
         log_level=os.getenv("SOCTALK_LOG_LEVEL", "DEBUG"),
         log_format=os.getenv("SOCTALK_LOG_FORMAT", "json"),
@@ -405,3 +447,54 @@ def get_config() -> Config:
     if _config is None:
         _config = load_config()
     return _config
+
+
+#Need to add this here to configure JIRA properly. ##
+
+## Dependencies 
+# pip install httpx mcp python-dotenv
+# Optional: pip install marklassian (for enhanced Atlassian Document Format conversion)
+
+
+## code 
+# {
+#   "mcpServers": {
+#     "jira": {
+#       "command": "python",
+#       "args": ["/app/mcp-servers/jira/jira.py"],
+#       "env": {
+#         "JIRA_URL": "https://your-org.atlassian.net",
+#         "JIRA_EMAIL": "service-account@your-org.com",
+#         "JIRA_API_TOKEN": "your_atlassian_api_token",
+#         "JIRA_DEFAULT_PROJECT": "SEC"
+#       }
+#     }
+#   }
+# }
+
+
+
+# virustotal mcp configuration
+
+# {
+#   "mcpServers": {
+#     "jira": {
+#       "command": "python",
+#       "args": ["/app/mcp-servers/jira/jira.py"],
+#       "env": {
+#         "JIRA_URL": "https://your-org.atlassian.net",
+#         "JIRA_EMAIL": "service-account@your-org.com",
+#         "JIRA_API_TOKEN": "your_atlassian_api_token",
+#         "JIRA_DEFAULT_PROJECT": "SEC"
+#       }
+#     },
+#     "virustotal": {
+#       "command": "python",
+#       "args": ["/app/mcp-servers/virustotal/virustotal.py"],
+#       "env": {
+#         "VIRUSTOTAL_API_KEY": "your_virustotal_api_key_here",
+#         "VT_REQUESTS_PER_MIN": "4"
+#       }
+#     }
+#   }
+# }

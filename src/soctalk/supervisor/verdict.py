@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-import structlog
 from langchain_core.messages import HumanMessage
+import structlog
 
+from soctalk.authorization.render import verdict_authorization_detail
 from soctalk.config import get_config
 from soctalk.inference import (
     InferenceAccounting,
@@ -17,7 +18,6 @@ from soctalk.inference import (
     resolve_tier_sampling,
 )
 from soctalk.llm import classify_llm_error as _classify_llm_error
-from soctalk.authorization.render import verdict_authorization_detail
 from soctalk.models.enums import Phase, VerdictDecision
 from soctalk.models.verdict import Verdict, VerdictDraft
 
@@ -117,6 +117,14 @@ Provide your verdict with these fields:
 - alternative_explanations: Benign explanations considered
 - recommendation: Complete 3-Part Markdown formatted report and action plan
 - additional_investigation_needed: (if needs_more_info) What specific investigation is needed
+
+# Additionally populate these Jira-oriented fields (used verbatim by the reporter):
+- threat_title: Short title for the Jira `threat_title` field (e.g. "NopalCyber SOC Alert | Patch.exe Detected on HOST1 | High")
+- threat_description: Customer-facing short threat description for Jira `threat_description` (starts with the Hi Team intro and the Threat Overview table — must NOT include Analysis or Recommendations)
+- impact_for_you: Concise "Analysis & Impact" text for Jira `impact_for_you` formatted as five fixed sections **(File Analysis, Process & Command-Line Analysis, Storyline Analysis, Persistence & Lateral Movement Analysis, Network Analysis)**. Each section must be bolded (plain text, not header) and followed by 1–2 bullet points. Avoid vendor or product names — use neutral terms like "reputation sources" or "reputation checks".
+- remediation_steps: 2–3 customer-facing actionable bullet points for Jira `remediation_steps`. Do NOT include "monitor" or open-ended observation tasks.
+
+Refer to the Jira ticket schema at `docs/jira_template.json` and emit a JSON object matching the required keys when producing the `recommendation` section used for automated reporting. The worker expects keys: `summary`, `threat_title`, `threat_description`, `impact_for_you`, `remediation_steps`, `customfield_10044`, `customfield_10220`, `project`, `issue_type`.
 """
 
 # Ordered most-static -> most-variable: alert evidence first, per-run
@@ -253,9 +261,12 @@ def _build_verdict_context(state: dict[str, Any]) -> dict[str, Any]:
     _VERDICT_ALERT_CAP = 10
     alerts_lines = []
     for alert in alerts[:_VERDICT_ALERT_CAP]:
+        if hasattr(alert, "model_dump"):
+            alert = alert.model_dump()
         severity = alert.get("severity", "unknown")
         desc = alert.get("rule_description", "No description")
-        agent = alert.get("source", {}).get("agent_name", "unknown")
+        agent_data = alert.get("source", {})
+        agent = agent_data.get("agent_name", "unknown") if isinstance(agent_data, dict) else "unknown"
         level = alert.get("level", 0)
         timestamp = alert.get("timestamp", "unknown")
 
@@ -271,26 +282,34 @@ def _build_verdict_context(state: dict[str, Any]) -> dict[str, Any]:
         )
         alerts_lines.append("")
 
-    # Format enrichments
+    # Format enrichments with safe model/dict unwrapping
     enrichments_lines = []
     malicious_count = 0
     suspicious_count = 0
 
     for e in enrichments:
-        verdict_val = e.get("verdict", "unknown")
+        if hasattr(e, "model_dump"):
+            e = e.model_dump()
+
+        verdict_raw = e.get("verdict", "unknown")
+        verdict_val = str(getattr(verdict_raw, "value", verdict_raw)).lower()
+
         obs = e.get("observable", {})
-        value = obs.get("value", "unknown")
-        obs_type = obs.get("type", "unknown")
-        analyzer = e.get("analyzer", "unknown")
+        if hasattr(obs, "model_dump"):
+            obs = obs.model_dump()
+
+        value = obs.get("value", "unknown") if isinstance(obs, dict) else str(obs)
+        obs_type = obs.get("type", "unknown") if isinstance(obs, dict) else "observable"
+        analyzer = e.get("analyzer", "VirusTotal")
         confidence = e.get("confidence", 0)
 
-        if verdict_val == "malicious":
+        if "malicious" in verdict_val:
             malicious_count += 1
             emoji = "🔴"
-        elif verdict_val == "suspicious":
+        elif "suspicious" in verdict_val:
             suspicious_count += 1
             emoji = "⚠️"
-        elif verdict_val == "benign":
+        elif "benign" in verdict_val or "clean" in verdict_val:
             emoji = "✅"
         else:
             emoji = "❓"
@@ -305,9 +324,17 @@ def _build_verdict_context(state: dict[str, Any]) -> dict[str, Any]:
     # Format findings
     findings_lines = []
     for f in findings:
-        severity = f.get("severity", "unknown")
-        desc = f.get("description", "No description")
-        evidence = f.get("evidence", [])
+        if hasattr(f, "model_dump"):
+            f = f.model_dump()
+
+        if isinstance(f, dict):
+            severity = f.get("severity", "unknown")
+            desc = f.get("description", "No description")
+            evidence = f.get("evidence", [])
+        else:
+            severity = "info"
+            desc = str(f)
+            evidence = []
 
         findings_lines.append(f"### [{severity.upper()}] {desc}")
         if evidence:
@@ -316,18 +343,24 @@ def _build_verdict_context(state: dict[str, Any]) -> dict[str, Any]:
                 findings_lines.append(f"  - {ev}")
         findings_lines.append("")
 
-    # Calculate duration
+    # Calculate duration safely
     started_at = state.get("started_at")
     if started_at:
         if isinstance(started_at, str):
-            started_at = datetime.fromisoformat(started_at)
-        now = (
-            datetime.now(started_at.tzinfo)
-            if started_at.tzinfo is not None
-            else datetime.now()
-        )
-        duration = now - started_at
-        duration_str = f"{duration.total_seconds():.0f} seconds"
+            try:
+                started_at = datetime.fromisoformat(started_at)
+            except Exception:
+                started_at = None
+        if started_at is not None:
+            now = (
+                datetime.now(started_at.tzinfo)
+                if started_at.tzinfo is not None
+                else datetime.now()
+            )
+            duration = now - started_at
+            duration_str = f"{duration.total_seconds():.0f} seconds"
+        else:
+            duration_str = "unknown"
     else:
         duration_str = "unknown"
 
@@ -358,6 +391,7 @@ async def _get_verdict(
     Args:
         config: Application configuration.
         context: Context dictionary.
+        state: Optional state dictionary for inference accounting.
 
     Returns:
         Verdict object.
@@ -369,11 +403,8 @@ async def _get_verdict(
         output_schema=VerdictDraft,
         system=VERDICT_SYSTEM_PROMPT,
         messages=[HumanMessage(content=VERDICT_USER_PROMPT_TEMPLATE.format(**context))],
-        # Reasoning sampling: a per-tier override (SOCTALK_REASONING_TEMPERATURE
-        # / _MAX_TOKENS) wins; otherwise the verdict's tuned defaults (slightly
-        # warmer than the router, longer output for the rationale).
         sampling=resolve_tier_sampling(
-            config.llm, InferenceTier.REASONING, temperature=0.1, max_tokens=2048,
+            config.llm, InferenceTier.REASONING, temperature=0.1, max_tokens=4096,
         ),
     )
     res = await ainvoke_request(req, cfg=config.llm)

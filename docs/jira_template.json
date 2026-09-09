@@ -1,0 +1,151 @@
+{
+  "description": "Jira ticket template: required keys, custom fields, and types used by soctalk jira_worker_node",
+  "required": [
+    "summary",
+    "description",
+    "threat_title",
+    "threat_description",
+    "impact_for_you",
+    "remediation_steps",
+    "customfield_10044",
+    "customfield_10220",
+    "project",
+    "issue_type"
+  ],
+  "summary_regex": "^(\\[?NopalCyber SOC Alert\\]?|Wazuh Alert \\(.+\\):) \\|? ?.+ (Detected on .+|events\\.) \\|? ?(Critical|High|Medium|Low)?$",
+  "fields": {
+    "summary": {
+      "type": "string",
+      "example": "[NopalCyber SOC Alert] | Suspicious PowerShell Execution Detected on windows-workstation | High"
+    },
+    "description": {
+      "type": "string",
+      "format": "markdown",
+      "description": "Part 1: Alert Details and metadata table"
+    },
+    "threat_title": {
+      "type": "string",
+      "example": "NopalCyber SOC Alert | Suspicious PowerShell Execution Detected on windows-workstation | High"
+    },
+    "threat_description": {
+      "type": "string",
+      "format": "markdown",
+      "description": "Part 2: Threat Overview and Threat Details Markdown tables"
+    },
+    "impact_for_you": {
+      "type": "string",
+      "format": "markdown",
+      "description": "Part 2: Multi-vector forensic analysis, narrative findings, and 30-day estate sweep"
+    },
+    "remediation_steps": {
+      "type": ["string", "array"],
+      "items": {"type": "string"},
+      "description": "Part 3: Actionable SOC recommendations (Containment, Verification, Eradication, Blocking, Tuning)"
+    },
+    "customfield_10044": {
+      "type": ["integer", "string"],
+      "description": "Severity option ID or label"
+    },
+    "customfield_10220": {
+      "type": ["integer", "string"],
+      "description": "Analyst verdict option ID or label"
+    },
+    "project": {
+      "type": "string",
+      "example": "SEC"
+    },
+    "issue_type": {
+      "type": "string",
+      "example": "Incident"
+    }
+  },
+  "custom_field_ids": {
+    "threat_title": "customfield_10299",
+    "impact_for_you": "customfield_10404",
+    "remediation_steps": "customfield_10403",
+    "severity": "customfield_10044",
+    "analyst_verdict": "customfield_10220",
+    "request_type": "customfield_10010",
+    "assigned_group": "customfield_10115"
+  },
+  "option_id_mappings": {
+    "severity": {
+      "Critical": "10028",
+      "High": "10029",
+      "Medium": "10030",
+      "Low": "10031"
+    },
+    "analyst_verdict": {
+      "True Positive – Malicious": "10327",
+      "True Positive – Benign / Expected": "10328",
+      "False Positive": "10329",
+      "Validation Required": "10765"
+    },
+    "request_type": "113",
+    "assigned_group": {
+      "name": "NopalCyber-MDR-L1"
+    }
+  },
+  "notes": "Replace option IDs with customer-specific values. If Jira requires ADF, worker converts markdown to ADF before sending. The LLM outputs these keys in JSON when prompted by the verdict prompt.",
+  "required_threat_overview_fields": [
+    "Threat Name",
+    "Jira ID",
+    "Severity",
+    "Investigation Verdict",
+    "Classification Source",
+    "Detection Engine",
+    "Host",
+    "Execution Security Context",
+    "Interactive User",
+    "Reported At",
+    "File Hash (SHA256)",
+    "File Path",
+    "Command Line Arguments",
+    "Originating Process",
+    "Device Health"
+  ],
+  "required_threat_details_fields": [
+    "Threat URL",
+    "Threat ID",
+    "Threat Status",
+    "Threat Filename",
+    "Threat Filepath",
+    "SHA",
+    "Process User",
+    "Publisher Name",
+    "Signer Identity",
+    "Signature Verification",
+    "Initiated By",
+    "Engines",
+    "Detection Type",
+    "Classification",
+    "File Size"
+  ],
+  "required_endpoint_fields": [
+    "Hostname",
+    "Account Name",
+    "Site Name",
+    "OS Version",
+    "Agent Version",
+    "Logged-in User",
+    "Domain",
+    "UUID",
+    "IPv4 Address",
+    "IPv6 Address",
+    "Console Visible IP",
+    "Connectivity",
+    "Network Status",
+    "Scan Status",
+    "Full Disk Scan",
+    "Pending Reboot",
+    "Number of Not Mitigated Threats"
+  ],
+  "required_analysis_sections": [
+    "**File Analysis**",
+    "**Process & Command-Line Analysis**",
+    "**Storyline Analysis**",
+    "**Persistence & Lateral Movement Analysis**",
+    "**Network Analysis**",
+    "**30-Day Estate Sweep Results**"
+  ]
+}

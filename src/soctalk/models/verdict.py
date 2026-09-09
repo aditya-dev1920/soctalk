@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 from pydantic import BaseModel, Field
 
 from soctalk.models.enums import (
-    VerdictDecision,
     EvidenceStrength,
     ImpactLevel,
     Urgency,
+    VerdictDecision,
 )
 
 
@@ -76,12 +76,31 @@ class VerdictDraft(BaseModel):
 
     # Final recommendation
     recommendation: str = Field(
-        ..., description="Final recommendation with reasoning"
+        ..., description="Final recommendation with reasoning (formatted in 3-part Markdown)"
+    )
+
+    # Fields mapped directly into Jira ticket payloads
+    threat_title: Optional[str] = Field(
+        default=None,
+        description="Short threat title suitable for Jira `threat_title` field",
+    )
+    threat_description: Optional[str] = Field(
+        default=None,
+        description="Customer-facing short threat description for Jira `threat_description` field",
+    )
+    impact_for_you: Optional[str] = Field(
+        default=None,
+        description="Concise 'Analysis & Impact' text for Jira `impact_for_you` field (bullet points)",
+    )
+    remediation_steps: Optional[str] = Field(
+        default=None,
+        description="Concise 'SOC Recommendations' for Jira `remediation_steps` field (bullet points)",
     )
 
     # If needs more info
-    additional_investigation_needed: Optional[list[str]] = Field(
-        None, description="What additional investigation is needed (if decision is needs_more_info)"
+    additional_investigation_needed: Optional[Union[list[str], str]] = Field(
+        default=None,
+        description="What additional investigation is needed (if decision is needs_more_info)",
     )
 
 
@@ -97,7 +116,13 @@ class Verdict(VerdictDraft):
     reasoning_model: str = Field(
         default="unknown", description="Model used for reasoning"
     )
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="UTC timestamp when verdict was produced",
+    )
+    applied_by: str = "ai_agent"
+    investigation_id: Optional[str] = None
+    id: Optional[str] = None
 
     def to_summary(self) -> str:
         """Generate a human-readable summary of the verdict.
@@ -116,15 +141,21 @@ class Verdict(VerdictDraft):
         lines = [
             f"=== VERDICT: {emoji} {self.decision.value.upper()}{sop_str} ===",
             f"Confidence: {self.confidence:.0%}",
+        ]
+
+        if self.threat_title:
+            lines.append(f"Threat Title: {self.threat_title}")
+
+        lines.extend([
             "",
-            f"## Threat Assessment",
+            "## Threat Assessment",
             f"{self.threat_assessment}",
             "",
             f"Evidence Strength: {self.evidence_strength.value}",
             f"Potential Impact: {self.potential_impact.value}",
             f"Urgency: {self.urgency.value}",
             "",
-        ]
+        ])
 
         if self.key_evidence:
             lines.append("## Key Evidence")
@@ -156,8 +187,11 @@ class Verdict(VerdictDraft):
         if self.additional_investigation_needed:
             lines.append("")
             lines.append("## Additional Investigation Needed")
-            for item in self.additional_investigation_needed:
-                lines.append(f"  → {item}")
+            if isinstance(self.additional_investigation_needed, list):
+                for item in self.additional_investigation_needed:
+                    lines.append(f"  → {item}")
+            else:
+                lines.append(f"  → {self.additional_investigation_needed}")
 
         return "\n".join(lines)
 
@@ -200,6 +234,15 @@ class Verdict(VerdictDraft):
             lines.append("ALTERNATIVE EXPLANATIONS:")
             for a in self.alternative_explanations[:3]:
                 lines.append(f"  • {a}")
+            lines.append("")
+
+        if self.additional_investigation_needed:
+            lines.append("ADDITIONAL INVESTIGATION NEEDED:")
+            if isinstance(self.additional_investigation_needed, list):
+                for item in self.additional_investigation_needed[:3]:
+                    lines.append(f"  → {item}")
+            else:
+                lines.append(f"  → {self.additional_investigation_needed}")
             lines.append("")
 
         lines.append("=" * 60)

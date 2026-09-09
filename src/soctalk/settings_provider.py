@@ -45,6 +45,19 @@ class IntegrationSettings:
     misp_url: Optional[str] = None
     misp_verify_ssl: bool = True
 
+    # Jira
+    jira_enabled: bool = False
+    jira_url: Optional[str] = None
+    jira_default_project: Optional[str] = None
+    jira_verify_ssl: bool = True
+
+    # VirusTotal
+    virustotal_enabled: bool = False
+    virustotal_rpm: Optional[int] = None
+
+    # AbuseIPDB
+    abuseipdb_enabled: bool = False
+
     # Slack
     slack_enabled: bool = False
     slack_channel: Optional[str] = None
@@ -62,17 +75,36 @@ class IntegrationSecrets:
     thehive_api_key: Optional[str] = None
     misp_api_key: Optional[str] = None
     slack_webhook_url: Optional[str] = None
+    # Jira / VirusTotal secrets
+    jira_api_token: Optional[str] = None
+    jira_email: Optional[str] = None
+    jira_bearer_token: Optional[str] = None
+    virustotal_api_key: Optional[str] = None
+    # AbuseIPDB
+    abuseipdb_api_key: Optional[str] = None
 
 
 def load_integration_secrets_from_env() -> IntegrationSecrets:
-    """Load secret integration settings from environment variables."""
+    """Load secret integration settings from environment variables with whitespace stripping."""
+    def _clean_env(name: str, *aliases: str) -> Optional[str]:
+        for key in (name, *aliases):
+            val = os.getenv(key)
+            if val is not None and val.strip():
+                return val.strip()
+        return None
+
     return IntegrationSecrets(
-        wazuh_username=os.getenv("WAZUH_API_USER") or os.getenv("WAZUH_API_USERNAME"),
-        wazuh_password=os.getenv("WAZUH_API_PASSWORD"),
-        cortex_api_key=os.getenv("CORTEX_API_KEY"),
-        thehive_api_key=os.getenv("THEHIVE_API_KEY") or os.getenv("THEHIVE_API_TOKEN"),
-        misp_api_key=os.getenv("MISP_API_KEY"),
-        slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL"),
+        wazuh_username=_clean_env("WAZUH_API_USER", "WAZUH_API_USERNAME"),
+        wazuh_password=_clean_env("WAZUH_API_PASSWORD"),
+        cortex_api_key=_clean_env("CORTEX_API_KEY"),
+        thehive_api_key=_clean_env("THEHIVE_API_KEY", "THEHIVE_API_TOKEN"),
+        misp_api_key=_clean_env("MISP_API_KEY"),
+        slack_webhook_url=_clean_env("SLACK_WEBHOOK_URL"),
+        jira_api_token=_clean_env("JIRA_API_TOKEN", "JIRA_PASSWORD", "JIRA_TOKEN"),
+        jira_email=_clean_env("JIRA_EMAIL", "JIRA_USERNAME"),
+        jira_bearer_token=_clean_env("JIRA_BEARER_TOKEN"),
+        virustotal_api_key=_clean_env("VIRUSTOTAL_API_KEY", "VT_API_KEY", "VT_APIKEY"),
+        abuseipdb_api_key=_clean_env("ABUSEIPDB_API_KEY"),
     )
 
 
@@ -93,6 +125,13 @@ def load_integration_settings_from_env() -> IntegrationSettings:
 
     cortex_url = os.getenv("CORTEX_URL") or os.getenv("CORTEX_ENDPOINT")
 
+    # Jira
+    jira_url = os.getenv("JIRA_URL")
+
+    # VirusTotal
+    vt_rpm = os.getenv("VT_REQUESTS_PER_MIN") or os.getenv("VIRUSTOTAL_RPM")
+    vt_rpm_val = int(vt_rpm) if vt_rpm and vt_rpm.isdigit() else None
+
     return IntegrationSettings(
         # Wazuh
         wazuh_enabled=_parse_bool(os.getenv("WAZUH_ENABLED"), False),
@@ -111,6 +150,16 @@ def load_integration_settings_from_env() -> IntegrationSettings:
         misp_enabled=_parse_bool(os.getenv("MISP_ENABLED"), False),
         misp_url=os.getenv("MISP_URL"),
         misp_verify_ssl=_parse_bool(os.getenv("MISP_VERIFY_SSL"), True),
+        # Jira
+        jira_enabled=_parse_bool(os.getenv("JIRA_ENABLED"), False),
+        jira_url=jira_url,
+        jira_default_project=os.getenv("JIRA_DEFAULT_PROJECT"),
+        jira_verify_ssl=_parse_bool(os.getenv("JIRA_VERIFY_SSL"), True),
+        # VirusTotal
+        virustotal_enabled=_parse_bool(os.getenv("VIRUSTOTAL_ENABLED"), False),
+        virustotal_rpm=vt_rpm_val,
+        # AbuseIPDB
+        abuseipdb_enabled=_parse_bool(os.getenv("ABUSEIPDB_ENABLED"), False),
         # Slack
         slack_enabled=_parse_bool(os.getenv("SLACK_ENABLED"), False),
         slack_channel=os.getenv("SLACK_CHANNEL"),
@@ -301,6 +350,106 @@ def create_misp_mcp_config(settings: IntegrationSettings) -> Optional[MCPServerC
     )
 
 
+def create_jira_mcp_config(settings: IntegrationSettings) -> Optional[MCPServerConfig]:
+    """Create Jira MCP server config from integration settings."""
+    if not settings.jira_enabled:
+        return None
+
+    secrets = load_integration_secrets_from_env()
+    jira_url = (settings.jira_url or os.getenv("JIRA_URL", "")).rstrip("/")
+
+    # Require URL and at least one valid auth method (Basic Auth: Email+Token OR Bearer Token)
+    has_basic_auth = bool(secrets.jira_email and secrets.jira_api_token)
+    has_bearer_auth = bool(secrets.jira_bearer_token)
+
+    if not jira_url or not (has_basic_auth or has_bearer_auth):
+        logger.warning(
+            "jira_enabled_but_missing_config",
+            url=bool(jira_url),
+            basic_auth=has_basic_auth,
+            bearer_auth=has_bearer_auth,
+        )
+        return None
+
+    base_path = Path(os.getenv("MCP_SERVERS_BASE_PATH", ".."))
+
+    return MCPServerConfig(
+        name="jira",
+        path=Path(
+            os.getenv(
+                "JIRA_MCP_SERVER_PATH",
+                str(base_path / "mcp-servers" / "jira" / "jira.py"),
+            )
+        ),
+        env_vars={
+            "JIRA_ENABLED": "true",
+            "JIRA_URL": jira_url,
+            "JIRA_EMAIL": secrets.jira_email or "",
+            "JIRA_API_TOKEN": secrets.jira_api_token or "",
+            "JIRA_BEARER_TOKEN": secrets.jira_bearer_token or "",
+            "JIRA_DEFAULT_PROJECT": settings.jira_default_project or os.getenv("JIRA_DEFAULT_PROJECT") or os.getenv("JIRA_PROJECT_KEY", "SEC"),
+            "JIRA_CUSTOM_FIELDS_JSON": os.getenv("JIRA_CUSTOM_FIELDS_JSON", "{}"),
+            "JIRA_VERIFY_SSL": "true" if settings.jira_verify_ssl else "false",
+        },
+    )
+
+
+def create_virustotal_mcp_config(settings: IntegrationSettings) -> Optional[MCPServerConfig]:
+    """Create VirusTotal MCP server config from integration settings."""
+    if not settings.virustotal_enabled:
+        return None
+
+    secrets = load_integration_secrets_from_env()
+    if not secrets.virustotal_api_key:
+        logger.warning("virustotal_enabled_but_missing_api_key")
+        return None
+
+    base_path = Path(os.getenv("MCP_SERVERS_BASE_PATH", ".."))
+    rpm_val = settings.virustotal_rpm or int(os.getenv("VT_REQUESTS_PER_MIN") or os.getenv("VIRUSTOTAL_RPM", "4"))
+
+    return MCPServerConfig(
+        name="virustotal",
+        path=Path(
+            os.getenv(
+                "VIRUSTOTAL_MCP_SERVER_PATH",
+                str(base_path / "mcp-servers" / "virustotal" / "virustotal.py"),
+            )
+        ),
+        env_vars={
+            "VIRUSTOTAL_ENABLED": "true",
+            "VIRUSTOTAL_API_KEY": secrets.virustotal_api_key,
+            "VT_REQUESTS_PER_MIN": str(rpm_val),
+        },
+    )
+
+
+def create_abuseipdb_mcp_config(settings: IntegrationSettings) -> Optional[MCPServerConfig]:
+    """Create AbuseIPDB MCP server config from integration settings.
+
+    Args:
+        settings: Integration settings from database.
+
+    Returns:
+        MCPServerConfig if AbuseIPDB is enabled and configured, None otherwise.
+    """
+    if not settings.abuseipdb_enabled:
+        return None
+
+    secrets = load_integration_secrets_from_env()
+    if not secrets.abuseipdb_api_key:
+        logger.warning("abuseipdb_enabled_but_missing_api_key")
+        return None
+
+    return MCPServerConfig(
+        name="abuseipdb",
+        path=Path("uvx"),
+        args=["mcp-abuseipdb"],
+        env_vars={
+            "ABUSEIPDB_API_KEY": secrets.abuseipdb_api_key,
+        },
+    )
+
+    
 @dataclass
 class EnabledMCPServers:
     """Container for enabled MCP server configurations."""
@@ -309,16 +458,19 @@ class EnabledMCPServers:
     cortex: Optional[MCPServerConfig] = None
     thehive: Optional[MCPServerConfig] = None
     misp: Optional[MCPServerConfig] = None
+    jira: Optional[MCPServerConfig] = None
+    virustotal: Optional[MCPServerConfig] = None
+    abuseipdb: Optional[MCPServerConfig] = None
 
     @property
     def has_any_enabled(self) -> bool:
         """Check if any MCP server is enabled."""
-        return any([self.wazuh, self.cortex, self.thehive, self.misp])
+        return any([self.wazuh, self.cortex, self.thehive, self.misp, self.jira, self.virustotal, self.abuseipdb])
 
     @property
     def enabled_count(self) -> int:
         """Count of enabled MCP servers."""
-        return sum(1 for s in [self.wazuh, self.cortex, self.thehive, self.misp] if s is not None)
+        return sum(1 for s in [self.wazuh, self.cortex, self.thehive, self.misp, self.jira, self.virustotal, self.abuseipdb] if s is not None)
 
 
 def create_mcp_configs(settings: IntegrationSettings) -> EnabledMCPServers:
@@ -335,4 +487,7 @@ def create_mcp_configs(settings: IntegrationSettings) -> EnabledMCPServers:
         cortex=create_cortex_mcp_config(settings),
         thehive=create_thehive_mcp_config(settings),
         misp=create_misp_mcp_config(settings),
+        jira=create_jira_mcp_config(settings),
+        virustotal=create_virustotal_mcp_config(settings),
+        abuseipdb=create_abuseipdb_mcp_config(settings),
     )

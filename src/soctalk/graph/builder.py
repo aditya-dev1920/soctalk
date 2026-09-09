@@ -29,6 +29,7 @@ from soctalk.workers.cortex import cortex_worker_node
 from soctalk.workers.misp import misp_worker_node
 from soctalk.workers.thehive import thehive_worker_node
 from soctalk.workers.wazuh import wazuh_worker_node
+from soctalk.workers.jira import jira_worker_node
 
 logger = structlog.get_logger()
 
@@ -310,6 +311,7 @@ def build_secops_graph(
     graph.add_node("verdict_guard", verdict_guard_node)
     graph.add_node("human_review", human_review_node)
     graph.add_node("thehive_worker", thehive_worker_node)
+    graph.add_node("jira_worker", jira_worker_node)
     graph.add_node("close_investigation", close_investigation_node)
 
     # Set entry point: deterministic triage policy resolution before the first LLM look.
@@ -377,8 +379,9 @@ def build_secops_graph(
     # TheHive leads to close
     graph.add_edge("thehive_worker", "close_investigation")
 
-    # Close leads to end
-    graph.add_edge("close_investigation", END)
+    # Close leads to Jira reporting, then end
+    graph.add_edge("close_investigation", "jira_worker")
+    graph.add_edge("jira_worker", END)
 
     # Compile the graph with optional checkpointer
     compiled = graph.compile(checkpointer=checkpointer)

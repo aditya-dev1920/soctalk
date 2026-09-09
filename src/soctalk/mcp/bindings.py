@@ -25,6 +25,9 @@ _wazuh_client: Optional[MCPClient] = None
 _cortex_client: Optional[MCPClient] = None
 _thehive_client: Optional[MCPClient] = None
 _misp_client: Optional[MCPClient] = None
+_jira_client: Optional[MCPClient] = None
+_virustotal_client: Optional[MCPClient] = None
+_abuseipdb_client: Optional[MCPClient] = None
 
 
 async def bind_clients(mcp_configs: Optional[EnabledMCPServers] = None) -> None:
@@ -35,13 +38,14 @@ async def bind_clients(mcp_configs: Optional[EnabledMCPServers] = None) -> None:
     Args:
         mcp_configs: Optional MCP server configurations from database settings.
                     If None, falls back to environment-based config.
-
-    Raises:
-        Exception: If any client fails to connect.
     """
-    global _manager, _wazuh_client, _cortex_client, _thehive_client, _misp_client
+    global _manager, _wazuh_client, _cortex_client, _thehive_client, _misp_client, _jira_client, _virustotal_client, _abuseipdb_client
 
     logger.info("binding_mcp_clients")
+
+    # Clean up any existing instances before creating a new manager
+    if _manager is not None:
+        await cleanup_clients()
 
     _manager = MCPClientManager()
 
@@ -62,6 +66,12 @@ async def bind_clients(mcp_configs: Optional[EnabledMCPServers] = None) -> None:
         connected.append("thehive")
     if _misp_client:
         connected.append("misp")
+    if _jira_client:
+        connected.append("jira")
+    if _virustotal_client:
+        connected.append("virustotal")
+    if _abuseipdb_client:
+        connected.append("abuseipdb")
 
     logger.info(
         "mcp_clients_bound",
@@ -78,7 +88,7 @@ async def _bind_from_db_settings(mcp_configs: EnabledMCPServers) -> None:
     Args:
         mcp_configs: MCP server configurations from database settings.
     """
-    global _wazuh_client, _cortex_client, _thehive_client, _misp_client
+    global _wazuh_client, _cortex_client, _thehive_client, _misp_client, _jira_client, _virustotal_client, _abuseipdb_client
 
     # Connect to Wazuh MCP server (if enabled)
     if mcp_configs.wazuh:
@@ -124,17 +134,58 @@ async def _bind_from_db_settings(mcp_configs: EnabledMCPServers) -> None:
     else:
         logger.info("misp_disabled_in_settings")
 
+    # Connect to Jira MCP server (if enabled)
+    if mcp_configs.jira:
+        logger.info("connecting_to_jira", config="database_settings")
+        try:
+            _jira_client = await _manager.add_client(mcp_configs.jira)
+            logger.info("jira_connected", tools=_jira_client.get_available_tools())
+        except Exception as e:
+            logger.error("jira_connection_failed", error=str(e))
+    else:
+        logger.info("jira_disabled_in_settings")
+
+    # Connect to VirusTotal MCP server (if enabled)
+    if mcp_configs.virustotal:
+        logger.info("connecting_to_virustotal", config="database_settings")
+        try:
+            _virustotal_client = await _manager.add_client(mcp_configs.virustotal)
+            logger.info("virustotal_connected", tools=_virustotal_client.get_available_tools())
+        except Exception as e:
+            logger.error("virustotal_connection_failed", error=str(e))
+    else:
+        logger.info("virustotal_disabled_in_settings")
+
+    # Connect to AbuseIPDB MCP server (if enabled)
+    if mcp_configs.abuseipdb:
+        logger.info("connecting_to_abuseipdb", config="database_settings")
+        try:
+            _abuseipdb_client = await _manager.add_client(mcp_configs.abuseipdb)
+            logger.info("abuseipdb_connected", tools=_abuseipdb_client.get_available_tools())
+        except Exception as e:
+            logger.error("abuseipdb_connection_failed", error=str(e))
+    else:
+        logger.info("abuseipdb_disabled_in_settings")
+
 
 async def _bind_from_env_config() -> None:
     """Bind MCP clients based on environment configuration.
 
-    This is the legacy fallback when database is not available.
+    This is the fallback when database settings are not supplied.
     """
-    global _wazuh_client, _cortex_client, _thehive_client, _misp_client
+    global _wazuh_client, _cortex_client, _thehive_client, _misp_client, _jira_client, _virustotal_client, _abuseipdb_client
 
     explicit_flags = any(
         os.getenv(name) is not None
-        for name in ["WAZUH_ENABLED", "CORTEX_ENABLED", "THEHIVE_ENABLED", "MISP_ENABLED"]
+        for name in [
+            "WAZUH_ENABLED",
+            "CORTEX_ENABLED",
+            "THEHIVE_ENABLED",
+            "MISP_ENABLED",
+            "JIRA_ENABLED",
+            "VIRUSTOTAL_ENABLED",
+            "ABUSEIPDB_ENABLED",
+        ]
     )
 
     if explicit_flags:
@@ -147,17 +198,33 @@ async def _bind_from_env_config() -> None:
     config = get_config()
     logger.info("using_legacy_env_config_fallback")
 
-    logger.info("connecting_to_wazuh", config="environment")
-    _wazuh_client = await _manager.add_client(config.wazuh_mcp_server)
+    servers = [
+        ("wazuh", config.wazuh_mcp_server),
+        ("cortex", config.cortex_mcp_server),
+        ("thehive", config.thehive_mcp_server),
+        ("misp", config.misp_mcp_server),
+        ("jira", config.jira_mcp_server),
+        ("virustotal", config.virustotal_mcp_server),
+    ]
 
-    logger.info("connecting_to_cortex", config="environment")
-    _cortex_client = await _manager.add_client(config.cortex_mcp_server)
-
-    logger.info("connecting_to_thehive", config="environment")
-    _thehive_client = await _manager.add_client(config.thehive_mcp_server)
-
-    logger.info("connecting_to_misp", config="environment")
-    _misp_client = await _manager.add_client(config.misp_mcp_server)
+    for name, srv_config in servers:
+        try:
+            logger.info(f"connecting_to_{name}", config="environment")
+            client = await _manager.add_client(srv_config)
+            if name == "wazuh":
+                _wazuh_client = client
+            elif name == "cortex":
+                _cortex_client = client
+            elif name == "thehive":
+                _thehive_client = client
+            elif name == "misp":
+                _misp_client = client
+            elif name == "jira":
+                _jira_client = client
+            elif name == "virustotal":
+                _virustotal_client = client
+        except Exception as e:
+            logger.warning(f"{name}_connection_failed", error=str(e))
 
     logger.info(
         "mcp_clients_bound_from_env",
@@ -165,6 +232,9 @@ async def _bind_from_env_config() -> None:
         cortex_tools=_cortex_client.get_available_tools() if _cortex_client else [],
         thehive_tools=_thehive_client.get_available_tools() if _thehive_client else [],
         misp_tools=_misp_client.get_available_tools() if _misp_client else [],
+        jira_tools=_jira_client.get_available_tools() if _jira_client else [],
+        virustotal_tools=_virustotal_client.get_available_tools() if _virustotal_client else [],
+        abuseipdb_tools=_abuseipdb_client.get_available_tools() if _abuseipdb_client else [],
     )
 
 
@@ -173,7 +243,7 @@ async def cleanup_clients() -> None:
 
     This should be called at application shutdown.
     """
-    global _manager, _wazuh_client, _cortex_client, _thehive_client, _misp_client
+    global _manager, _wazuh_client, _cortex_client, _thehive_client, _misp_client, _jira_client, _virustotal_client, _abuseipdb_client
 
     logger.info("cleaning_up_mcp_clients")
 
@@ -185,8 +255,15 @@ async def cleanup_clients() -> None:
     _cortex_client = None
     _thehive_client = None
     _misp_client = None
+    _jira_client = None
+    _virustotal_client = None
+    _abuseipdb_client = None
 
     logger.info("mcp_clients_cleaned_up")
+
+
+# Lifecycle alias for runs-worker compatibility
+unbind_clients = cleanup_clients
 
 
 def get_wazuh_client() -> Optional[MCPClient]:
@@ -234,6 +311,24 @@ def get_misp_client() -> Optional[MCPClient]:
     return _misp_client
 
 
+def get_jira_client() -> Optional[MCPClient]:
+    """Get the Jira MCP client.
+
+    Returns:
+        The Jira MCPClient instance, or None if not connected.
+    """
+    return _jira_client
+
+
+def get_virustotal_client() -> Optional[MCPClient]:
+    """Get the VirusTotal MCP client.
+
+    Returns:
+        The VirusTotal MCPClient instance, or None if not connected.
+    """
+    return _virustotal_client
+
+
 def is_wazuh_enabled() -> bool:
     """Check if Wazuh integration is enabled and connected."""
     return _wazuh_client is not None
@@ -254,6 +349,16 @@ def is_misp_enabled() -> bool:
     return _misp_client is not None
 
 
+def is_jira_enabled() -> bool:
+    """Check if Jira integration is enabled and connected."""
+    return _jira_client is not None
+
+
+def is_virustotal_enabled() -> bool:
+    """Check if VirusTotal integration is enabled and connected."""
+    return _virustotal_client is not None
+
+
 def get_enabled_integrations() -> list[str]:
     """Get list of enabled integration names."""
     enabled = []
@@ -265,4 +370,8 @@ def get_enabled_integrations() -> list[str]:
         enabled.append("thehive")
     if _misp_client:
         enabled.append("misp")
+    if _jira_client:
+        enabled.append("jira")
+    if _virustotal_client:
+        enabled.append("virustotal")
     return enabled

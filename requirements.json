@@ -1,8 +1,8 @@
 {
   "project": "soctalk",
-  "description": "SecOps LLM Agent using LangGraph with Wazuh, Cortex, and TheHive integration via MCP",
+  "description": "SecOps LLM Agent using LangGraph with Wazuh,VirusTotal, JIRA integration, Cortex, and TheHive integration via MCP",
   "version": "0.2.0",
-  "last_updated": "2025-12-09",
+  "last_updated": "2026-08-31",
   "implementation_status": "in_progress",
   "architecture": {
     "pattern": "Supervisor + Specialized Workers",
@@ -14,7 +14,9 @@
       "../mcp-server-wazuh",
       "../mcp-server-cortex",
       "../mcp-server-thehive",
-      "../mcp-server-misp"
+      "../mcp-server-misp",
+      "../mcp-server-virustotal",
+      "../mcp-server-jira"
     ],
     "persistence": {
       "database": "postgresql",
@@ -59,9 +61,11 @@
       "status": "completed",
       "tasks": [
         {"name": "WazuhWorker (poll, forensics)", "status": "completed"},
+        {"name": "VirusTotalWorker (threat reputation enrichment)", "status": "completed"},
         {"name": "CortexWorker (enrichment)", "status": "completed"},
         {"name": "TheHiveWorker (incidents)", "status": "completed"},
-        {"name": "MISPWorker (threat intel)", "status": "completed"}
+        {"name": "MISPWorker (threat intel)", "status": "completed"},
+        {"name": "JiraWorker (case management & escalations)", "status": "completed"}
       ]
     },
     {
@@ -129,7 +133,7 @@
         {"id": "9.2", "name": "Define metrics_hourly table", "status": "completed"},
         {"id": "9.3", "name": "Define ioc_stats table", "status": "completed"},
         {"id": "9.4", "name": "Define rule_stats table", "status": "completed"},
-        {"id": "9.5", "name": "Define analyzer_stats table", "status": "completed"},
+        {"id": "9.5", "name": "Define threat_intel_stats table", "status": "completed"},
         {"id": "9.6", "name": "Implement Projector class", "status": "completed"},
         {"id": "9.7", "name": "Project investigation lifecycle events", "status": "completed"},
         {"id": "9.8", "name": "Project metrics and stats events", "status": "completed"},
@@ -157,11 +161,11 @@
         {"id": "11.2", "name": "Emit INVESTIGATION_CREATED in orchestrator", "status": "completed"},
         {"id": "11.3", "name": "Emit ALERT_CORRELATED when alerts correlated", "status": "completed"},
         {"id": "11.4", "name": "Emit OBSERVABLE_EXTRACTED in alert processing", "status": "completed"},
-        {"id": "11.5", "name": "Emit ENRICHMENT_* events in cortex_worker", "status": "completed"},
+        {"id": "11.5", "name": "Emit ENRICHMENT_* events in virustotal_worker", "status": "completed"},
         {"id": "11.6", "name": "Emit SUPERVISOR_DECISION in supervisor_node", "status": "completed"},
         {"id": "11.7", "name": "Emit VERDICT_RENDERED in verdict_node", "status": "completed"},
         {"id": "11.8", "name": "Emit HUMAN_* events in hil_node", "status": "completed"},
-        {"id": "11.9", "name": "Emit THEHIVE_CASE_CREATED in thehive_worker", "status": "completed"},
+        {"id": "11.9", "name": "Emit JIRA_TICKET_CREATED in jira_worker", "status": "completed"},
         {"id": "11.10", "name": "Emit INVESTIGATION_CLOSED in close_node", "status": "completed"},
         {"id": "11.11", "name": "Add idempotency keys for external API calls", "status": "completed"}
       ]
@@ -346,6 +350,8 @@
       {"name": "alembic", "version": ">=1.13.0", "purpose": "Database migrations"},
       {"name": "fastapi", "version": ">=0.115.0", "purpose": "REST API framework"},
       {"name": "uvicorn", "version": ">=0.32.0", "purpose": "ASGI server"},
+      {"name": "httpx", "version": ">=0.27.0", "purpose": "Async HTTP client for Jira and VirusTotal"},
+      {"name": "mcp", "version": ">=1.0.0", "purpose": "Model Context Protocol SDK"},
       {"name": "sse-starlette", "version": ">=2.1.0", "purpose": "Server-Sent Events"},
       {"name": "langgraph-checkpoint-postgres", "version": ">=2.0.0", "purpose": "LangGraph PostgreSQL checkpointer"}
     ],
@@ -358,6 +364,10 @@
   },
   "new_files": {
     "backend": [
+      "docs/jira_template.json",
+      "src/soctalk/workers/virustotal.py",
+      "src/soctalk/workers/jira.py",
+      "src/soctalk/workers/jira_schema.py",
       "src/soctalk/persistence/__init__.py",
       "src/soctalk/persistence/database.py",
       "src/soctalk/persistence/models.py",
@@ -373,6 +383,8 @@
       "src/soctalk/api/routes/metrics.py",
       "src/soctalk/api/routes/events.py",
       "src/soctalk/api/routes/audit.py",
+      "tests/test_jira_schema.py",
+      "tests/test_jira_worker_e2e.py",      
       "alembic.ini",
       "alembic/env.py",
       "alembic/versions/"
@@ -405,7 +417,11 @@
     },
     "investigations": {
       "description": "Read model for investigation state",
-      "columns": ["id UUID PK", "title TEXT", "status TEXT", "phase TEXT", "created_at TIMESTAMPTZ", "updated_at TIMESTAMPTZ", "closed_at TIMESTAMPTZ", "time_to_triage_seconds INT", "time_to_verdict_seconds INT", "alert_count INT", "observable_count INT", "malicious_count INT", "max_severity TEXT", "verdict_decision TEXT", "verdict_confidence REAL", "thehive_case_id TEXT", "threat_actor TEXT", "tags TEXT[]"]
+      "columns": ["id UUID PK", "title TEXT", "status TEXT", "phase TEXT", "created_at TIMESTAMPTZ", "updated_at TIMESTAMPTZ", "closed_at TIMESTAMPTZ", "time_to_triage_seconds INT", "time_to_verdict_seconds INT", "alert_count INT", "observable_count INT", "malicious_count INT", "max_severity TEXT", "verdict_decision TEXT", "verdict_confidence REAL", "jira_issue_key TEXT", "jira_ticket_id TEXT", "threat_actor TEXT", "tags TEXT[]"]
+    },
+    "threat_intel_stats": {
+      "description": "Threat intelligence provider statistics",
+      "columns": ["provider TEXT PK", "invocations INT", "successes INT", "failures INT", "avg_response_time_ms REAL"]
     },
     "metrics_hourly": {
       "description": "Hourly aggregated metrics",
@@ -436,6 +452,8 @@
     "verdict.rendered",
     "human.review_requested",
     "human.decision_received",
+    "jira.ticket_created",
+    "jira.comment_added",
     "thehive.case_created",
     "phase.changed"
   ],
@@ -452,7 +470,13 @@
       "scan_url_with_virustotal",
       "analyze_url_with_urlscan_io",
       "scan_hash_with_virustotal",
-      "analyze_with_abusefinder"
+      "analyze_with_abusefinder",
+      "virustotal_get_file_report",
+      "virustotal_get_ip_report",
+      "virustotal_get_domain_report",
+      "virustotal_get_url_report",
+      "virustotal_get_file_behaviour",
+      "virustotal_get_file_relationship"
     ],
     "thehive": [
       "get_thehive_alerts",
@@ -467,6 +491,26 @@
       "check_misp_warninglist",
       "get_misp_sightings",
       "get_misp_threat_actor_iocs"
+    ],
+    "virustotal": [
+      "vt_check_hash",
+      "vt_check_ip",
+      "vt_check_domain",
+      "vt_check_url",
+      "virustotal_get_file_report",
+      "virustotal_get_ip_report",
+      "virustotal_get_domain_report",
+      "virustotal_get_url_report",
+      "virustotal_get_file_behaviour",
+      "virustotal_get_file_relationship"
+    ],
+    "jira": [
+      "jira_create_ticket",
+      "jira_search",
+      "jira_add_comment",
+      "jira_create_subtask",
+      "jira_get_issue",
+      "jira_transition_issue"
     ]
   },
   "files_created": [
