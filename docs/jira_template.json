@@ -12,7 +12,7 @@
     "project",
     "issue_type"
   ],
-  "summary_regex": "^(\\[?NopalCyber SOC Alert\\]?|Wazuh Alert \\(.+\\):) \\|? ?.+ (Detected on .+|events\\.) \\|? ?(Critical|High|Medium|Low)?$",
+  "summary_regex": "^(\\[?NopalCyber SOC Alert\\]?|Wazuh Alert \\(.+\\):) \\|? ?.+ (Detected on .+|events\\.) \\|? ?(Critical|Highest|High|Medium|Low)?$",
   "fields": {
     "summary": {
       "type": "string",
@@ -61,10 +61,15 @@
   },
   "custom_field_ids": {
     "threat_title": "customfield_10299",
+    "threat_description": "customfield_10402",
     "impact_for_you": "customfield_10404",
     "remediation_steps": "customfield_10403",
+    "impact": "customfield_10404",
+    "remediation": "customfield_10403",
     "severity": "customfield_10044",
     "analyst_verdict": "customfield_10220",
+    "threat_category": "customfield_10303",
+    "top_level_category": "customfield_10534",
     "request_type": "customfield_10010",
     "assigned_group": "customfield_10115"
   },
@@ -98,7 +103,7 @@
     "Execution Security Context",
     "Interactive User",
     "Reported At",
-    "File Hash (SHA256)",
+    "File Hash",
     "File Path",
     "Command Line Arguments",
     "Originating Process",
@@ -145,7 +150,6 @@
     "**Process & Command-Line Analysis**",
     "**Storyline Analysis**",
     "**Persistence & Lateral Movement Analysis**",
-    "**Network Analysis**",
-    "**30-Day Estate Sweep Results**"
+    "**Network Analysis**"
   ]
 }

@@ -99,7 +99,7 @@ def main():
         sql_seed = f"""
         TRUNCATE TABLE investigation_runs CASCADE;
         INSERT INTO investigation_runs (id, tenant_id, investigation_id, status, not_before, started_at)
-        SELECT gen_random_uuid(), tenant_id, id, 'active', '1970-01-01 00:00:00+00'::timestamptz, NOW()
+        SELECT gen_random_uuid(), tenant_id, id, 'pending', '1970-01-01 00:00:00+00'::timestamptz, NOW()
         FROM investigations
         WHERE id = '{args.investigation_id}';
         """

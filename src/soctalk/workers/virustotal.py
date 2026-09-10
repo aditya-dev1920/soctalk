@@ -24,6 +24,7 @@ from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 import mcp.server.stdio
 import mcp.types as types
+import inspect
 
 load_dotenv()
 
@@ -33,6 +34,103 @@ logging.basicConfig(
 )
 logger = logging.getLogger("soctalk.mcp.virustotal")
 server = Server("virustotal")
+
+# --- Universal Low-Level MCP SDK Adapter ---
+from pydantic import BaseModel, Field
+
+class ListToolsParams(BaseModel):
+    cursor: str | None = None
+    model_config = {"extra": "allow"}
+
+class CallToolParams(BaseModel):
+    name: str = ""
+    arguments: dict[str, Any] | None = None
+    model_config = {"extra": "allow"}
+
+class _MCPHandlerEntry:
+    """Wraps handlers with the params_type model expected by mcp.server.runner."""
+    def __init__(self, params_type: type[BaseModel], handler: Any):
+        self.params_type = params_type
+        self.handler = handler
+        self.call = handler
+        self.func = handler
+
+    async def __call__(self, *args, **kwargs):
+        return await self.handler(*args, **kwargs)
+
+def _mcp_list_tools_adapter():
+    def decorator(func):
+        async def _handler(*args, **kwargs) -> types.ListToolsResult:
+            tools = await func()
+            return types.ListToolsResult(tools=tools)
+
+        entry = _MCPHandlerEntry(ListToolsParams, _handler)
+
+        try:
+            server.add_request_handler("tools/list", ListToolsParams, _handler)
+        except Exception:
+            pass
+
+        for attr in ("_request_handlers", "request_handlers"):
+            d = getattr(server, attr, None)
+            if isinstance(d, dict):
+                d["tools/list"] = entry
+                if hasattr(types, "ListToolsRequest"):
+                    d[types.ListToolsRequest] = entry
+        return func
+    return decorator
+
+def _mcp_call_tool_adapter():
+    def decorator(func):
+        async def _handler(*args, **kwargs) -> types.CallToolResult:
+            tool_name = ""
+            tool_args = {}
+
+            for a in args:
+                if hasattr(a, "name") and getattr(a, "name"):
+                    tool_name = getattr(a, "name")
+                    tool_args = getattr(a, "arguments", None) or {}
+                    break
+                elif isinstance(a, dict) and "name" in a:
+                    tool_name = a["name"]
+                    tool_args = a.get("arguments") or {}
+                    break
+
+            if not tool_name:
+                tool_name = kwargs.get("name", "")
+                tool_args = kwargs.get("arguments") or {}
+
+            sig = inspect.signature(func)
+            if len(sig.parameters) == 1:
+                res = await func(args[0] if args else kwargs)
+            else:
+                res = await func(tool_name, tool_args)
+
+            if isinstance(res, types.CallToolResult):
+                return res
+            if isinstance(res, list):
+                return types.CallToolResult(content=res)
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(res))])
+
+        entry = _MCPHandlerEntry(CallToolParams, _handler)
+
+        try:
+            server.add_request_handler("tools/call", CallToolParams, _handler)
+        except Exception:
+            pass
+
+        for attr in ("_request_handlers", "request_handlers"):
+            d = getattr(server, attr, None)
+            if isinstance(d, dict):
+                d["tools/call"] = entry
+                if hasattr(types, "CallToolRequest"):
+                    d[types.CallToolRequest] = entry
+        return func
+    return decorator
+
+server.list_tools = _mcp_list_tools_adapter
+server.call_tool = _mcp_call_tool_adapter
+# -------------------------------------------
 
 
 class AsyncTokenBucket:
@@ -409,16 +507,19 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
 
 async def main() -> None:
     async with mcp.server.stdio.stdio_server() as (read, write):
+        caps = server.get_capabilities(
+            notification_options=NotificationOptions(),
+            experimental_capabilities={},
+        )
+        caps.tools = types.ToolsCapability(listChanged=False)
+
         await server.run(
             read,
             write,
             InitializationOptions(
                 server_name="virustotal",
                 server_version="0.3.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
+                capabilities=caps,
             ),
         )
 
