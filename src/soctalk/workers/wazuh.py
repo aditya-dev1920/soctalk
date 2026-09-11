@@ -32,24 +32,28 @@ async def wazuh_worker_node(state: dict[str, Any]) -> dict[str, Any]:
     logger.info("wazuh_worker_started")
 
     client = get_wazuh_client()
+    if client is None:
+        logger.warning("wazuh_client_not_bound_skipping")
+        state["last_error"] = "Wazuh client not bound"
+        state["last_updated"] = datetime.now().isoformat()
+        return state
+
     investigation = state.get("investigation", {})
     supervisor_decision = state.get("supervisor_decision", {})
     specific_instructions = (supervisor_decision.get("specific_instructions") or "") if supervisor_decision else ""
 
     try:
-        # Determine what action to take based on instructions
-        if "forensics" in specific_instructions.lower() or "process" in specific_instructions.lower():
-            # Get forensic data for affected agents
-            state = await _get_agent_forensics(client, state)
-        elif "vulnerability" in specific_instructions.lower() or "vuln" in specific_instructions.lower():
-            # Get vulnerability data
+        # Execute agent context resolution first
+        state = await _get_agent_context(client, state)
+
+        # If instructions mention vulnerability specifically, run vuln check
+        if "vulnerability" in specific_instructions.lower() or "vuln" in specific_instructions.lower():
             state = await _get_vulnerabilities(client, state)
         elif "log" in specific_instructions.lower():
-            # Search logs
             state = await _search_logs(client, state)
         else:
-            # Default: get agent context for alerts
-            state = await _get_agent_context(client, state)
+            # Run forensics (processes & ports) by default on the resolved agent
+            state = await _get_agent_forensics(client, state)
 
         state["last_error"] = None
         logger.info("wazuh_worker_completed")
@@ -76,41 +80,119 @@ async def _get_agent_context(client: Any, state: dict[str, Any]) -> dict[str, An
     investigation = state.get("investigation", {})
     alerts = investigation.get("alerts", [])
 
-    if not alerts:
-        return state
+    # Resolve agent names or IDs across flat, nested, and state alerts
+    agent_targets = set()
 
-    # Get unique agent names from alerts
-    agent_names = set()
-    for alert in alerts:
-        source = alert.get("source", {})
-        agent_name = source.get("agent_name")
-        if agent_name and agent_name != "unknown":
-            agent_names.add(agent_name)
+    # 1. Check direct alert in state
+    top_alert = state.get("alert") or {}
+    alerts_to_scan = alerts if alerts else ([top_alert] if top_alert else [])
 
-    if not agent_names:
-        return state
+    for alert in alerts_to_scan:
+        agent_field = alert.get("agent")
+        if isinstance(agent_field, dict):
+            name = agent_field.get("name")
+            aid = agent_field.get("id")
+            if name and name != "unknown":
+                agent_targets.add(str(name))
+            elif aid and aid != "unknown":
+                agent_targets.add(str(aid))
 
-    # Query agent information
-    for agent_name in list(agent_names)[:5]:  # Limit to 5 agents
+        # Check standard host fields
+        host = alert.get("host") or alert.get("hostname") or alert.get("endpoint_name")
+        if host and host != "unknown":
+            agent_targets.add(str(host))
+
+    # Fallback to investigation host or default cluster host
+    if not agent_targets and investigation.get("host") and investigation.get("host") != "unknown":
+        agent_targets.add(str(investigation.get("host")))
+
+    metadata = investigation.get("metadata", {})
+    agents_info = metadata.get("agents_info", {})
+
+    # If no targets were present in standard fields, match alert indicators against active agents
+    if not agent_targets:
+        logger.info("matching_alert_clues_against_active_agents")
         try:
-            result = await client.call_tool(
-                "get_wazuh_agents",
-                {"status": "active", "name": agent_name, "limit": 1}
-            )
+            active_agents = await client.call_tool("get_wazuh_agents", {"status": "active", "limit": 10})
+            if active_agents and "Error" not in str(active_agents):
+                agents_raw = str(active_agents)
+                import json
+                alert_text = json.dumps(alerts_to_scan).lower()
 
-            if result:
-                # Add agent context to investigation metadata
-                metadata = investigation.get("metadata", {})
-                agents_info = metadata.get("agents_info", {})
-                agents_info[agent_name] = result
+                # Iterate through each agent block returned by Wazuh MCP
+                for block in agents_raw.split("Agent ID:")[1:]:
+                    lines = block.strip().split("\n")
+                    aid = lines[0].split()[0].strip()
+                    
+                    name = next((l.split(":", 1)[1].strip() for l in lines if l.startswith("Name:")), "")
+                    ip = next((l.split(":", 1)[1].strip() for l in lines if l.startswith("IP:")), "")
+
+                    # Match specific endpoint name or IP (never match Agent 000 on generic 'manager' headers)
+                    target_host_clues = []
+                    for a in alerts_to_scan:
+                        a_dict = a if isinstance(a, dict) else (a.model_dump() if hasattr(a, "model_dump") else {})
+                        target_host_clues.extend([
+                            str(a_dict.get("host") or ""),
+                            str(a_dict.get("hostname") or ""),
+                            str(a_dict.get("endpoint_name") or ""),
+                            str((a_dict.get("agent") or {}).get("name") if isinstance(a_dict.get("agent"), dict) else ""),
+                            str((a_dict.get("agent") or {}).get("id") if isinstance(a_dict.get("agent"), dict) else ""),
+                        ])
+                    target_clues_text = " ".join(target_host_clues).lower()
+
+                    is_match = (
+                        (name and name.lower() in target_clues_text)
+                        or (ip and ip != "127.0.0.1" and ip in alert_text)
+                        or (aid == "000" and ("nopal-siem" in target_clues_text or "000" in target_clues_text))
+                    )
+
+                    if is_match:
+                        target_name = name or f"agent-{aid}"
+                        agents_info[target_name] = f"Agent ID: {aid}\nName: {target_name}"
+                        logger.info("agent_matched_to_alert", agent_id=aid, agent_name=target_name)
+                        break
+
+                if not agents_info:
+                    logger.info("alert_not_linked_to_known_agent_skipping_forensics")
+                    return state
+
                 metadata["agents_info"] = agents_info
                 investigation["metadata"] = metadata
+                state["investigation"] = investigation
+                return state
+        except Exception as e:
+            logger.warning("failed_matching_active_agents", error=str(e))
+            return state
 
-                logger.info("agent_context_retrieved", agent=agent_name)
+    metadata = investigation.get("metadata", {})
+    agents_info = metadata.get("agents_info", {})
+
+    # Query agent information
+    for target in list(agent_targets)[:5]:
+        try:
+            # If target is numeric, query by agent ID; otherwise query by agent name
+            if target.isdigit():
+                query_params = {"status": "active", "limit": 1}
+            else:
+                query_params = {"status": "active", "name": target, "limit": 1}
+
+            result = await client.call_tool("get_wazuh_agents", query_params)
+
+            if result and "Error" not in str(result):
+                agents_info[target] = str(result)
+                logger.info("agent_context_retrieved", agent=target)
+            else:
+                # Fallback: Query all active agents to locate by partial host match
+                all_agents = await client.call_tool("get_wazuh_agents", {"status": "active", "limit": 10})
+                if all_agents:
+                    agents_info[target] = str(all_agents)
+                    logger.info("agent_context_retrieved_via_active_list", agent=target)
 
         except Exception as e:
-            logger.warning("failed_to_get_agent_info", agent=agent_name, error=str(e))
+            logger.warning("failed_to_get_agent_info", agent=target, error=str(e))
 
+    metadata["agents_info"] = agents_info
+    investigation["metadata"] = metadata
     state["investigation"] = investigation
     return state
 
@@ -131,6 +213,7 @@ async def _get_agent_forensics(client: Any, state: dict[str, Any]) -> dict[str, 
     agents_info = metadata.get("agents_info", {})
 
     findings = investigation.get("findings", [])
+    alerts = investigation.get("alerts") or ([state.get("alert")] if state.get("alert") else [])
 
     # Get agent IDs from metadata
     for agent_name, agent_data in agents_info.items():
@@ -139,12 +222,26 @@ async def _get_agent_forensics(client: Any, state: dict[str, Any]) -> dict[str, 
         if not agent_id:
             continue
 
-        # Get running processes
-        try:
-            processes_result = await client.call_tool(
-                "get_wazuh_agent_processes",
-                {"agent_id": agent_id, "limit": 50}
+        # Derive target process from alert details (binary name, service, or rule description)
+        target_process = None
+        for a in alerts:
+            a_dict = a if isinstance(a, dict) else (a.model_dump() if hasattr(a, "model_dump") else {})
+            target_process = (
+                a_dict.get("process_name")
+                or a_dict.get("filename")
+                or ("postgres" if "postgres" in str(a_dict).lower() else None)
+                or ("ssh" if "ssh" in str(a_dict).lower() else None)
             )
+            if target_process:
+                break
+
+        # Query running processes filtered by target service/binary
+        try:
+            query_params: dict[str, Any] = {"agent_id": agent_id, "limit": 50}
+            if target_process:
+                query_params["search"] = target_process[:32]
+
+            processes_result = await client.call_tool("get_wazuh_agent_processes", query_params)
 
             if processes_result:
                 # Look for suspicious processes
@@ -270,24 +367,36 @@ async def _search_logs(client: Any, state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _extract_agent_id(agent_data: str) -> str | None:
-    """Extract agent ID from Wazuh response text.
+    """Extract agent ID from Wazuh response text or JSON structures.
 
     Args:
         agent_data: Raw agent data string.
 
     Returns:
-        Agent ID or None.
+        Agent ID formatted as a string or None.
     """
-    # Parse "ID: 001" pattern from response
     import re
-    match = re.search(r"ID:\s*(\d+)", agent_data)
+
+    # Match JSON key: "id": "001" or "id": 1
+    json_match = re.search(r'["\']id["\']\s*:\s*["\']?(\d+)["\']?', agent_data)
+    if json_match:
+        return json_match.group(1).zfill(3)
+
+    # Match formatted text: "ID: 001" or "Agent: 001"
+    match = re.search(r'(?:ID|Agent):\s*(\d+)', agent_data, re.IGNORECASE)
     if match:
-        return match.group(1).zfill(3)  # Ensure 3-digit format
+        return match.group(1).zfill(3)
+
+    # Match standalone 3-digit agent patterns (e.g. 000, 001)
+    generic_match = re.search(r'\b(00\d)\b', agent_data)
+    if generic_match:
+        return generic_match.group(1)
+
     return None
 
 
 def _analyze_processes(processes_text: str) -> list[str]:
-    """Analyze processes for suspicious activity.
+    """Analyze processes for suspicious activity with regex word boundaries and kernel thread exclusion.
 
     Args:
         processes_text: Raw processes text from Wazuh.
@@ -295,18 +404,25 @@ def _analyze_processes(processes_text: str) -> list[str]:
     Returns:
         List of suspicious process descriptions.
     """
+    import re
     suspicious = []
     suspicious_patterns = [
-        "powershell", "cmd.exe", "wscript", "cscript", "mshta",
-        "certutil", "bitsadmin", "regsvr32", "rundll32",
-        "nc", "ncat", "netcat", "curl", "wget",
-        "mimikatz", "procdump", "psexec",
+        r"powershell(?:\.exe)?", r"cmd\.exe", r"wscript(?:\.exe)?", r"cscript(?:\.exe)?",
+        r"mshta(?:\.exe)?", r"certutil(?:\.exe)?", r"bitsadmin(?:\.exe)?",
+        r"regsvr32(?:\.exe)?", r"rundll32(?:\.exe)?",
+        r"\bnc(?:\.exe)?\b", r"\bncat(?:\.exe)?\b", r"\bnetcat(?:\.exe)?\b",
+        r"\bcurl(?:\.exe)?\b", r"\bwget(?:\.exe)?\b",
+        r"mimikatz", r"procdump", r"psexec",
     ]
 
     lines = processes_text.lower().split("\n")
     for line in lines:
+        # Ignore Linux kernel worker threads and parent PID 2 tasks
+        if "ppid: 2" in line or line.strip().startswith(("name: kworker", "name: cpuhp", "name: idle_inject")):
+            continue
+
         for pattern in suspicious_patterns:
-            if pattern in line:
+            if re.search(pattern, line):
                 suspicious.append(f"Suspicious process: {line.strip()[:100]}")
                 break
 

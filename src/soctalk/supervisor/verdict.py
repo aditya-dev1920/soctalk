@@ -59,7 +59,8 @@ break-glass emergency change.
 Distinguish ABSENT evidence from CONTRADICTED evidence — they call for different decisions:
 - ABSENT: the context carries no authorization records at all for this activity. Never treat
   absence as implicit approval; when the case hinges on authorization and evidence is genuinely
-  missing, prefer needs_more_info over close.
+  missing, prefer escalate (with sop_verdict: "Validation Required") over close so a tracking
+  Jira ticket is filed for user/asset owner validation. NEVER output needs_more_info.
 - CONTRADICTED: authorization records ARE present but fail to cover — expired, pending,
   future-effective, CAB-unapproved, out-of-window, frozen, or scoped to a different
   host/account/path. That mismatch is itself the finding: someone acted outside the terms of
@@ -98,9 +99,10 @@ Select both the internal routing `decision` and the formal `sop_verdict` using t
   - **Severity:** Strictly `Low` (`10031`).
 
 ### RULE D: VALIDATION REQUIRED (AMBIGUOUS DUAL-USE TOOLS)
-- **Trigger:** Ambiguous administrative utilities or native maintenance scripts executed without confirmed malicious indicators where business authorization is unknown:
-  - **Verdict:** Strictly `sop_verdict: "Validation Required - Suspicious"` (`decision: "needs_more_info"` or `"escalate"`).
+- **Trigger:** Ambiguous administrative utilities, native scripts in unusual contexts, or unverified commercial tools without malicious indicators where business authorization is unknown:
+  - **Verdict:** Strictly `sop_verdict: "Validation Required"` (`decision: "escalate"`).
   - **Severity:** `Medium` (`10030`) for 3rd-party tools; `Low` (`10031`) for native scripts.
+  - **MANDATORY ROUTING RULE:** ALWAYS set `decision: "escalate"`. In Tier-3 SOC workflows, validation requests require a Jira ticket so analysts can confirm legitimacy with the customer. NEVER output `decision: "needs_more_info"`.
 
 ## Report Formatting Requirements (in `recommendation` field)
 
@@ -124,7 +126,10 @@ Structure your `recommendation` string using this exact 3-part Markdown format:
 ## Response Format
 
 Provide your verdict with these fields:
-- decision: "escalate" | "close" | "needs_more_info"
+- decision: "escalate" | "close"
+  * Use "escalate" for True Positive – Malicious, True Positive – Policy Violation, and Validation Required (to trigger Jira ticket creation).
+  * Use "close" ONLY for verified False Positives and clean baseline noise.
+  * DO NOT output "needs_more_info" — investigations must terminate in either "escalate" (with ticket creation) or "close".
 - sop_verdict: "True Positive – Malicious" | "True Positive – Benign / Expected" | "False Positive" | "Validation Required"
 - confidence: 0.0-1.0
 - threat_assessment: Overall assessment of the threat
@@ -227,13 +232,14 @@ async def verdict_node(
         state["verdict"] = verdict.model_dump()
         state["current_phase"] = Phase.VERDICT.value
 
-        # Track retry count for NEEDS_MORE_INFO decisions
+        # Programmatic Tier-3 Guardrail: Upgrade NEEDS_MORE_INFO to ESCALATE
+        # Ensures Validation Required always routes to the reporter node for Jira ticket creation
         if verdict.decision == VerdictDecision.NEEDS_MORE_INFO:
-            state["verdict_retry_count"] = state.get("verdict_retry_count", 0) + 1
             logger.info(
-                "verdict_needs_more_info",
-                retry_count=state["verdict_retry_count"],
+                "overriding_needs_more_info_to_escalate_for_jira",
+                sop_verdict=verdict.sop_verdict.value if verdict.sop_verdict else None,
             )
+            verdict = verdict.model_copy(update={"decision": VerdictDecision.ESCALATE})
 
         logger.info(
             "verdict_rendered",

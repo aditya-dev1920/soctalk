@@ -166,11 +166,9 @@ async def jira_worker_node(state: dict[str, Any]) -> dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
 
     try:
+        # Allow execution from both verdict phase and escalation phase
         current_phase = state.get("current_phase")
-        if current_phase and current_phase != Phase.ESCALATION.value:
-            logger.info("jira_worker_skipped_not_in_escalation", current_phase=current_phase)
-            state["last_updated"] = now_iso
-            return state
+        logger.info("jira_worker_evaluating", current_phase=current_phase)
 
         if getattr(investigation, "jira_issue_key", None):
             logger.info("jira_already_created", key=investigation.jira_issue_key)
@@ -190,7 +188,12 @@ async def jira_worker_node(state: dict[str, Any]) -> dict[str, Any]:
             if hasattr(investigation, "model_dump")
             else (investigation if isinstance(investigation, dict) else {})
         )
-        findings = state.get("findings") or []
+        # Fallback to the first alert in investigation if state["alert"] is unpopulated
+        if not alert and inv.get("alerts"):
+            first_alert = inv["alerts"][0]
+            alert = first_alert.model_dump() if hasattr(first_alert, "model_dump") else (first_alert if isinstance(first_alert, dict) else {})
+        # Capture findings from state or investigation metadata
+        findings = state.get("findings") or inv.get("findings") or []
         enrichments = inv.get("enrichments") or []
         verdict = state.get("verdict") or {}
 
@@ -214,8 +217,59 @@ async def jira_worker_node(state: dict[str, Any]) -> dict[str, Any]:
             or alert.get("rule_id")
             or "Security Incident"
         )
-        raw_host = alert.get("host") or inv.get("host") or alert.get("hostname") or "unknown"
+
+        # Deep inspection across flat and nested telemetry structures
+        agent_obj = alert.get("agent") if isinstance(alert.get("agent"), dict) else {}
+        raw_host = (
+            alert.get("host")
+            or alert.get("hostname")
+            or agent_obj.get("name")
+            or alert.get("endpoint_name")
+            or alert.get("computer_name")
+            or inv.get("host")
+            or "nopal-siem"
+        )
         raw_sev = str(alert.get("severity") or inv.get("severity") or "Medium").strip().capitalize()
+
+        # Extract enriched IP observables across state and investigation metadata
+        observables = inv.get("observables") or state.get("observables") or []
+        
+        def _get_obs_val_and_type(o: Any) -> tuple[str | None, str | None]:
+            if isinstance(o, dict):
+                t = o.get("type")
+                t_str = getattr(t, "value", str(t or "")).lower()
+                return str(o.get("value") or ""), t_str
+            val = getattr(o, "value", None)
+            t = getattr(o, "type", None)
+            t_str = getattr(t, "value", str(t or "")).lower()
+            return str(val) if val else None, t_str
+
+        extracted_ips = []
+        for o in observables:
+            val, t_type = _get_obs_val_and_type(o)
+            if val and "ip" in (t_type or ""):
+                extracted_ips.append(val)
+
+        obs_ip = next((ip for ip in extracted_ips if not ip.startswith("25.2.")), None) or (extracted_ips[0] if extracted_ips else None)
+        raw_ip = alert.get("ipv4") or alert.get("ip") or obs_ip or "N/A"
+
+        # Sanitize status enum object into clean title text
+        raw_status = inv.get("status")
+        status_clean = (
+            getattr(raw_status, "value", str(raw_status or "Active"))
+            .replace("InvestigationStatus.", "")
+            .replace("_", " ")
+            .title()
+        )
+
+        # Sanitize SOP verdict enum into clean title text
+        raw_sop_verdict = verdict.get("sop_verdict") or inv.get("sop_verdict") or "Validation Required"
+        sop_verdict_clean = (
+            getattr(raw_sop_verdict, "value", str(raw_sop_verdict))
+            .replace("SOPVerdict.", "")
+            .replace("_", " ")
+            .title()
+        )
 
         # 3. Assemble Normalized Summary & Threat Title
         summary = _ensure_summary_format(
@@ -241,15 +295,16 @@ async def jira_worker_node(state: dict[str, Any]) -> dict[str, Any]:
             or state.get("started_at")
             or now_iso
         )
-
+        
+        # Sanitize SOP verdict enum
+        raw_sop = verdict.get("sop_verdict") or inv.get("sop_verdict") or "Validation Required"
+        sop_verdict_clean = getattr(raw_sop, "value", str(raw_sop)).replace("SOPVerdict.", "").replace("_", " ").title()
+        
         threat_overview_rows = [
             ("Threat Name", raw_threat_name),
             ("Jira ID", "N/A"),
             ("Severity", raw_sev),
-            (
-                "Investigation Verdict",
-                verdict.get("sop_verdict") or inv.get("sop_verdict") or "Validation Required",
-            ),
+            ("Investigation Verdict", sop_verdict_clean),
             ("Classification Source", alert.get("source") or "Wazuh"),
             ("Detection Engine", alert.get("detection_engine") or alert.get("rule_id") or "unknown"),
             ("Host", raw_host),
@@ -265,8 +320,8 @@ async def jira_worker_node(state: dict[str, Any]) -> dict[str, Any]:
 
         threat_details_rows = [
             ("Threat URL", alert.get("url") or "N/A"),
-            ("Threat ID", alert.get("id") or alert.get("event_id") or "N/A"),
-            ("Threat Status", inv.get("status") or "Mitigated"),
+            ("Threat ID", str(alert.get("id") or alert.get("event_id") or inv.get("id") or "N/A")),
+            ("Threat Status", status_clean or "Mitigated"),
             ("Threat Filename", alert.get("filename") or alert.get("threat_name") or "N/A"),
             ("Threat Filepath", alert.get("file_path") or "N/A"),
             ("SHA256", alert.get("sha256") or "N/A"),
@@ -296,27 +351,27 @@ async def jira_worker_node(state: dict[str, Any]) -> dict[str, Any]:
             ("Hostname", raw_host),
             ("Account Name", inv.get("account_name") or "NopalCyber"),
             ("Site Name", inv.get("site_name") or "Production"),
-            ("OS Version", inv.get("os_version") or "Windows 10 Pro"),
-            ("Agent Version", inv.get("agent_version") or alert.get("agent_version") or "4.8.0"),
+            ("OS Version", inv.get("os_version") or "Linux / Ubuntu 24.04"),
+            ("Agent Version", inv.get("agent_version") or alert.get("agent_version") or agent_obj.get("version") or "4.8.0"),
             ("Logged-in User", alert.get("user") or inv.get("user") or "N/A"),
             ("Domain", inv.get("domain") or "WORKGROUP"),
-            ("UUID", inv.get("agent_uuid") or "N/A"),
-            ("IPv4 Address", alert.get("ipv4") or inv.get("ipv4") or "N/A"),
+            ("UUID", inv.get("agent_uuid") or agent_obj.get("id") or "N/A"),
+            ("IPv4 Address", raw_ip),
             ("IPv6 Address", alert.get("ipv6") or "N/A"),
             ("Console Visible IP", inv.get("public_ip") or "N/A"),
-            ("Connectivity", inv.get("connectivity") or "Connected"),
-            ("Network Status", inv.get("network_status") or "Connected"),
-            ("Scan Status", inv.get("scan_status") or "Finished"),
-            ("Full Disk Scan", inv.get("full_disk_scan") or "No"),
-            ("Pending Reboot", inv.get("pending_reboot") or "No"),
+            ("Connectivity", "Connected"),
+            ("Network Status", "Connected"),
+            ("Scan Status", "Finished"),
+            ("Full Disk Scan", "No"),
+            ("Pending Reboot", "No"),
             ("Number of Not Mitigated Threats", inv.get("not_mitigated_count") or 0),
         ]
 
         detection_rows = [
             ("Detection Timestamp", alert.get("timestamp") or reported_at),
             ("Reported Time", reported_at),
-            ("Storyline / Correlation ID", inv.get("id") or "N/A"),
-            ("Incident Status", inv.get("status") or "Active"),
+            ("Storyline / Correlation ID", str(inv.get("id") or state.get("run_id") or "N/A")),
+            ("Incident Status", status_clean),
             ("MITRE ATT&CK", ", ".join(inv.get("mitre", [])) if inv.get("mitre") else "N/A"),
         ]
 
@@ -336,13 +391,22 @@ async def jira_worker_node(state: dict[str, Any]) -> dict[str, Any]:
             f"#### Threat Details\n{_md_table(threat_details_rows)}"
         )
 
+        # Enforce strict SOP headers: retain structured tables unless LLM output conforms
+        final_threat_description = threat_description_body
+        if (
+            vt_threat_description
+            and "Threat Overview" in vt_threat_description
+            and "Threat Details" in vt_threat_description
+        ):
+            final_threat_description = vt_threat_description
+
         # 6. Build Main Description (Part 1 Alert Details)
         description_body = (
             f"#### Endpoint Details\n{_md_table(endpoint_rows)}\n\n---\n\n"
             f"#### Detection Time Details\n{_md_table(detection_rows)}"
         )
 
-        # 7. Map Severity and Analyst Verdict Option IDs
+        # 7. Map Severity, Analyst Verdict, and Category Option IDs per Tier-3 SOP
         severity_map = {"Critical": 10028, "High": 10029, "Medium": 10030, "Low": 10031}
         severity_id = severity_map.get(raw_sev, 10030)
 
@@ -350,32 +414,49 @@ async def jira_worker_node(state: dict[str, Any]) -> dict[str, Any]:
             verdict.get("sop_verdict") or inv.get("sop_verdict") or "Validation Required"
         ).strip()
         sop_norm = sop_str.lower()
+
         if "true positive" in sop_norm and "benign" not in sop_norm:
-            analyst_verdict_id = 10327
-        elif "true positive" in sop_norm and "benign" in sop_norm:
-            analyst_verdict_id = 10328
-        elif "false positive" in sop_norm:
             analyst_verdict_id = 10329
-        else:
-            analyst_verdict_id = 10765
+            threat_category_id = 10830  # Malware
+            top_level_category_id = 10994  # Malware
+        elif "policy violation" in sop_norm:
+            analyst_verdict_id = 10329
+            threat_category_id = 10840  # Unauthorized Activity
+            top_level_category_id = 10995  # Apps
+        elif "false positive" in sop_norm:
+            analyst_verdict_id = 10327
+            threat_category_id = 10862  # Authorized Application
+            top_level_category_id = 10995  # Apps
+        else:  # Validation Required / Suspicious
+            analyst_verdict_id = 10336
+            threat_category_id = 10831  # Suspicious Process
+            top_level_category_id = 10995  # Apps
 
         # 8. Assemble Full Jira Payload
         jira_args: dict[str, Any] = {
             "summary": summary,
             "description": description_body,
             "threat_title": threat_title,
-            "threat_description": vt_threat_description or threat_description_body,
+            "threat_description": final_threat_description,
             "impact_for_you": analysis_text,
             "remediation_steps": recommendations_text,
-            "customfield_10299": threat_title,
-            "customfield_10404": analysis_text,
-            "customfield_10403": recommendations_text,
-            "customfield_10044": severity_id,
-            "customfield_10220": analyst_verdict_id,
-            "customfield_10010": "113",
-            "customfield_10115": [{"name": "NopalCyber-MDR-L1"}],
-            "issue_type": "Incident",
-            "project": (inv.get("jira_project") or alert.get("project") or "SEC"),
+            "severity": str(severity_id),
+            "analyst_verdict_id": str(analyst_verdict_id),
+            "threat_category_id": str(threat_category_id),
+            "top_level_category_id": str(top_level_category_id),
+            "issue_type": (
+                inv.get("jira_issue_type")
+                or alert.get("issue_type")
+                or os.getenv("JIRA_ISSUE_TYPE")
+                or "SentinelOne"
+            ),
+            "project": (
+                inv.get("jira_project")
+                or alert.get("project")
+                or os.getenv("JIRA_DEFAULT_PROJECT")
+                or os.getenv("JIRA_PROJECT")
+                or "NTE"
+            ),
             "labels": ["soctalk", "auto-triage", "nopal-soc"],
         }
 

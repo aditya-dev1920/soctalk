@@ -216,6 +216,60 @@ def _text_to_adf(text: str | None) -> dict[str, Any]:
             i += 1
             continue
 
+        # Horizontal Rules (---, ***, ___)
+        if re.match(r"^(?:---|\*\*\*|___)\s*$", trimmed):
+            content.append({"type": "rule"})
+            i += 1
+            continue
+
+        # Markdown Tables (| Col 1 | Col 2 | ...)
+        if trimmed.startswith("|") and trimmed.endswith("|"):
+            table_lines = []
+            while i < len(lines) and lines[i].strip().startswith("|") and lines[i].strip().endswith("|"):
+                table_lines.append(lines[i].strip())
+                i += 1
+
+            table_rows: list[dict[str, Any]] = []
+            is_first_row = True
+
+            for t_line in table_lines:
+                # Split cells using unescaped pipes
+                raw_cells = [
+                    c.replace(r"\|", "|").strip()
+                    for c in re.split(r"(?<!\\)\|", t_line.strip("|"))
+                ]
+                # Skip markdown separator rows (e.g., | :--- | :--- |)
+                if all(re.match(r"^:?-+:?$", c) for c in raw_cells if c):
+                    continue
+
+                cell_type = "tableHeader" if is_first_row else "tableCell"
+                row_cells = []
+                for cell in raw_cells:
+                    cell_text = cell if cell else " "
+                    row_cells.append({
+                        "type": cell_type,
+                        "attrs": {},
+                        "content": [{
+                            "type": "paragraph",
+                            "content": _parse_inline_formatting(cell_text),
+                        }],
+                    })
+
+                if row_cells:
+                    table_rows.append({
+                        "type": "tableRow",
+                        "content": row_cells,
+                    })
+                is_first_row = False
+
+            if table_rows:
+                content.append({
+                    "type": "table",
+                    "attrs": {"isNumberColumnEnabled": False, "layout": "default"},
+                    "content": table_rows,
+                })
+            continue
+
         # Code blocks (```lang ... ```)
         if trimmed.startswith("```"):
             code_lines = []
@@ -248,10 +302,15 @@ def _text_to_adf(text: str | None) -> dict[str, Any]:
                 content.append({"type": "bulletList", "content": list_items})
             continue
 
-        # Standard Paragraphs
+        # Standard Paragraphs (Do not swallow headings, code, lists, tables, or rules)
         paragraph_lines = [trimmed]
         i += 1
-        while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith(("#", "```", "* ", "- ")):
+        while (
+            i < len(lines)
+            and lines[i].strip()
+            and not lines[i].strip().startswith(("#", "```", "* ", "- ", "|"))
+            and not re.match(r"^(?:---|\*\*\*|___)\s*$", lines[i].strip())
+        ):
             paragraph_lines.append(lines[i].strip())
             i += 1
 
@@ -294,9 +353,9 @@ def _get_credentials() -> dict[str, Any]:
     }
 
     custom_fields_raw = os.getenv("JIRA_CUSTOM_FIELDS_JSON", "")
-    if custom_fields_raw:
+    if custom_fields_raw and custom_fields_raw.strip() not in ("", "{}"):
         try:
-            custom_fields = json.loads(custom_fields_raw)
+            custom_fields = json.loads(custom_fields_raw) or default_custom_fields
         except Exception:
             custom_fields = default_custom_fields
     else:
@@ -532,18 +591,25 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             # Tool 1: jira_create_ticket (NopalCyber MDR Template)
             # -------------------------------------------------------------
             if name == "jira_create_ticket":
+                cf = creds.get("custom_fields", {})
                 summary = _sanitize_text(args.get("summary"), "NopalCyber SOC Alert | Security Incident")[:255]
                 desc = _coerce_to_str(args.get("description"))
-                threat_title = str(args.get("threat_title") or summary)[:255]
-                threat_desc = _coerce_to_str(args.get("threat_description"))
-                impact = _coerce_to_str(args.get("impact_for_you"))
-                remediation = _coerce_to_str(args.get("remediation_steps"))
-                severity_val = args.get("severity") or "10030"
-                project_key = _sanitize_text(args.get("project") or default_project, "SEC").upper()
-                issue_type = _sanitize_text(args.get("issue_type") or "Incident", "Incident")
+                threat_title = str(args.get("threat_title") or args.get("customfield_10299") or summary)[:255]
+                threat_desc = _coerce_to_str(args.get("threat_description") or args.get("customfield_10402"))
+                impact = _coerce_to_str(args.get("impact_for_you") or args.get("customfield_10404"))
+                remediation = _coerce_to_str(args.get("remediation_steps") or args.get("customfield_10403"))
+                
+                # Resolve select option IDs cleanly whether passed via named key or customfield ID
+                severity_val = str(args.get("severity") or args.get("customfield_10044") or "10030")
+                verdict_val = str(args.get("analyst_verdict_id") or args.get("customfield_10220") or "10336")
+                threat_cat_val = str(args.get("threat_category_id") or args.get("customfield_10303") or "10831")
+                top_cat_val = str(args.get("top_level_category_id") or args.get("customfield_10534") or "10995")
+
+                project_key = _sanitize_text(args.get("project") or default_project, "NTE").upper()
+                issue_type = _sanitize_text(args.get("issue_type", "SentinelOne"), "SentinelOne")
                 labels = args.get("labels") or ["soctalk", "auto-triage", "nopal-soc"]
 
-                # Composite fallback body if custom fields are not present on screen
+                # Build composite fallback body including all sections
                 composite_body_parts = [desc]
                 if impact:
                     composite_body_parts.append(f"## Analysis and Impact\n{impact}")
@@ -551,49 +617,30 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
                     composite_body_parts.append(f"## SOC Recommendations\n{remediation}")
                 full_description_text = "\n\n---\n\n".join(filter(None, composite_body_parts))
 
+                # Primary payload strictly aligned with NopalCyber Jira v3 schema
                 fields: dict[str, Any] = {
                     "project": {"key": project_key},
                     "summary": summary,
                     "description": _text_to_adf(desc if (impact or remediation) else full_description_text),
                     "issuetype": {"name": issue_type},
-                    "priority": {"name": _map_priority(severity_val)},
                     "labels": [re.sub(r"[^\w-]", "", str(lbl))[:255] for lbl in labels if str(lbl).strip()],
+                    
+                    # Custom Text Fields (Must be ADF objects)
+                    cf.get("threat_title", "customfield_10299"): _text_to_adf(threat_title),
+                    cf.get("threat_description", "customfield_10402"): _text_to_adf(threat_desc),
+                    cf.get("impact", "customfield_10404"): _text_to_adf(impact),
+                    cf.get("remediation", "customfield_10403"): _text_to_adf(remediation),
+                    
+                    # Custom Select Fields (Must be {"id": "..."})
+                    cf.get("severity", "customfield_10044"): {"id": severity_val},
+                    cf.get("analyst_verdict", "customfield_10220"): {"id": verdict_val},
+                    cf.get("threat_category", "customfield_10303"): {"id": threat_cat_val},
+                    cf.get("top_level_category", "customfield_10534"): {"id": top_cat_val},
+                    
+                    # Static MDR Fields
+                    cf.get("request_type", "customfield_10010"): "113",
+                    cf.get("assigned_group", "customfield_10115"): {"name": "NopalCyber-MDR-L1"},
                 }
-
-                cf = creds.get("custom_fields", {})
-
-                # Text Custom Fields: Single-line uses string; multi-line uses ADF
-                if threat_title and cf.get("threat_title"):
-                    fields[cf["threat_title"]] = threat_title
-                if threat_desc and cf.get("threat_description"):
-                    fields[cf["threat_description"]] = _text_to_adf(threat_desc)
-                if impact and cf.get("impact"):
-                    fields[cf["impact"]] = _text_to_adf(impact)
-                if remediation and cf.get("remediation"):
-                    fields[cf["remediation"]] = _text_to_adf(remediation)
-
-                # Select Option Custom Fields
-                if severity_val and cf.get("severity"):
-                    s_val = str(severity_val)
-                    fields[cf["severity"]] = {"id": s_val} if s_val.isdigit() else {"value": s_val}
-
-                if args.get("analyst_verdict_id") and cf.get("analyst_verdict"):
-                    v_val = str(args["analyst_verdict_id"])
-                    fields[cf["analyst_verdict"]] = {"id": v_val} if v_val.isdigit() else {"value": v_val}
-
-                if args.get("threat_category_id") and cf.get("threat_category"):
-                    tc_val = str(args["threat_category_id"])
-                    fields[cf["threat_category"]] = {"id": tc_val} if tc_val.isdigit() else {"value": tc_val}
-
-                if args.get("top_level_category_id") and cf.get("top_level_category"):
-                    tlc_val = str(args["top_level_category_id"])
-                    fields[cf["top_level_category"]] = {"id": tlc_val} if tlc_val.isdigit() else {"value": tlc_val}
-
-                # Static MDR Defaults
-                if cf.get("request_type"):
-                    fields[cf["request_type"]] = "113"
-                if cf.get("assigned_group"):
-                    fields[cf["assigned_group"]] = [{"name": "NopalCyber-MDR-L1"}]
 
                 # Attempt Jira Cloud API v3
                 endpoint_v3 = f"{base_url}/rest/api/3/issue"
@@ -619,8 +666,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
                         "project": {"key": project_key},
                         "summary": summary,
                         "description": _text_to_adf(full_description_text),
-                        "issuetype": {"name": "Task" if issue_type not in {"Incident", "Task", "Bug"} else issue_type},
-                        "priority": {"name": _map_priority(severity_val)},
+                        "issuetype": {"name": issue_type},
                         "labels": fields["labels"],
                     }
                     resp = await client.post(endpoint_v3, auth=auth, headers=headers, json={"fields": safe_fields})

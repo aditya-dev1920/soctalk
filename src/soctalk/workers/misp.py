@@ -47,9 +47,23 @@ async def misp_worker_node(state: dict[str, Any]) -> dict[str, Any]:
 
     client = get_misp_client()
     investigation = state.get("investigation", {})
-
-    # Get observables that haven't been checked with MISP yet
     observables = investigation.get("observables", [])
+
+    if client is None:
+        logger.info("misp_disabled_skipping_worker")
+        # Mark all observables as checked so the supervisor breaks out of CONTEXTUALIZE
+        misp_context = investigation.get("misp_context") or {}
+        checked_values = set(misp_context.get("checked_iocs", []))
+        for obs in observables:
+            val = obs.get("value") if isinstance(obs, dict) else getattr(obs, "value", None)
+            if val:
+                checked_values.add(str(val))
+
+        misp_context["checked_iocs"] = list(checked_values)
+        misp_context["status"] = "disabled"
+        investigation["misp_context"] = misp_context
+        state["investigation"] = investigation
+        return state
     misp_context = investigation.get("misp_context") or {}
     checked_values = set(misp_context.get("checked_iocs", []))
 

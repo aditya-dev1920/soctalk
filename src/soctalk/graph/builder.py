@@ -354,9 +354,12 @@ def build_secops_graph(
     # Every verdict passes through the deterministic guard before routing.
     graph.add_edge("verdict", "verdict_guard")
 
-    # The (possibly overridden) verdict routes to HIL, close, or back to supervisor
+    # Tier-3 SOP: Mandatory Jira reporting for all verdicts prior to review/closure
+    graph.add_edge("verdict_guard", "jira_worker")
+
+    # After Jira ticket creation, route based on verdict decision
     graph.add_conditional_edges(
-        "verdict_guard",
+        "jira_worker",
         route_from_verdict,
         {
             "human_review": "human_review",
@@ -379,9 +382,8 @@ def build_secops_graph(
     # TheHive leads to close
     graph.add_edge("thehive_worker", "close_investigation")
 
-    # Close leads to Jira reporting, then end
-    graph.add_edge("close_investigation", "jira_worker")
-    graph.add_edge("jira_worker", END)
+    # Close leads directly to end
+    graph.add_edge("close_investigation", END)
 
     # Compile the graph with optional checkpointer
     compiled = graph.compile(checkpointer=checkpointer)

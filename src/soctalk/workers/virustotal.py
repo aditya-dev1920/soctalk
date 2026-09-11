@@ -136,7 +136,8 @@ server.call_tool = _mcp_call_tool_adapter
 class AsyncTokenBucket:
     """Async token bucket rate limiter for VirusTotal API tier constraints."""
 
-    def __init__(self, requests_per_minute: int = 4) -> None:
+    def __init__(self, requests_per_minute: int = 15) -> None:
+        self.enabled = requests_per_minute > 0
         self.capacity = max(1, requests_per_minute)
         self.tokens = float(self.capacity)
         self.rate = self.capacity / 60.0  # Tokens per second
@@ -144,6 +145,9 @@ class AsyncTokenBucket:
         self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
+        if not self.enabled:
+            return
+
         async with self._lock:
             now = time.monotonic()
             elapsed = now - self.last_update
@@ -160,8 +164,8 @@ class AsyncTokenBucket:
                 self.tokens -= 1.0
 
 
-# Rate limit configuration (Default: 4 req/min for free public tier)
-_rpm = int(os.getenv("VT_REQUESTS_PER_MIN", os.getenv("VIRUSTOTAL_RPM", "4")))
+# Rate limit configuration (Default: 15 req/min; set 0 to disable throttling)
+_rpm = int(os.getenv("VT_REQUESTS_PER_MIN", os.getenv("VIRUSTOTAL_RPM", "15")))
 _limiter = AsyncTokenBucket(requests_per_minute=_rpm)
 
 
@@ -408,10 +412,28 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
                 ).strip()
                 clean_domain = _refang(raw_domain).lower()
 
+                # Strip email user part if an email address was passed as a domain
+                if "@" in clean_domain:
+                    clean_domain = clean_domain.split("@")[-1]
+
                 # Strip protocol/path if LLM passes a full URL by accident
                 if "://" in clean_domain:
                     clean_domain = urlparse(clean_domain).netloc
                 clean_domain = clean_domain.split("/")[0].split(":")[0]
+
+                # Bypass API for internal infrastructure and documentation domains
+                if clean_domain in ("attack.mitre.org", "mitre.org", "nopalcyber.com"):
+                    return _result({
+                        "success": True,
+                        "domain": clean_domain,
+                        "found": True,
+                        "verdict": "clean",
+                        "malicious": 0,
+                        "suspicious": 0,
+                        "total_engines": 0,
+                        "reputation": 0,
+                        "note": "Whitelisted documentation or internal enterprise domain; external lookup skipped.",
+                    })
 
                 if not clean_domain or "." not in clean_domain:
                     return _result({"success": False, "error": f"Invalid domain format '{raw_domain}'."})
@@ -456,6 +478,21 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
 
                 if not clean_url.startswith(("http://", "https://")):
                     clean_url = f"http://{clean_url}"
+
+                # Bypass API for static MITRE ATT&CK and educational references
+                if "attack.mitre.org" in clean_url or "mitre.org" in clean_url:
+                    return _result({
+                        "success": True,
+                        "url": clean_url,
+                        "found": True,
+                        "verdict": "clean",
+                        "malicious": 0,
+                        "suspicious": 0,
+                        "total_engines": 0,
+                        "reputation": 0,
+                        "note": "Whitelisted MITRE ATT&CK documentation reference URL; external lookup skipped.",
+                        "permalink": clean_url,
+                    })
 
                 url_id = base64.urlsafe_b64encode(clean_url.encode()).decode().rstrip("=")
                 resp = await _vt_api_get(f"urls/{url_id}", client)
